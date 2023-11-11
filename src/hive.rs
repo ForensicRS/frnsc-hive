@@ -4,6 +4,7 @@ pub struct HivePrimaryFile {
     pub base_block : BaseBlock
 }
 
+#[derive(Debug)]
 pub struct BaseBlock {
     /// Primary sequence number.
     /// This number is incremented by 1 in the beginning of a write operation on the primary file
@@ -141,6 +142,23 @@ pub struct BaseBlockW10 {
     pub boot_recovery : u32
 }
 
+#[repr(C, packed)]
+#[derive(Debug)]
+pub struct HiveBinHeader {
+    /// ASCII string hbin
+    pub signature : u32,
+    /// Offset of a current hive bin in bytes, relative from the start of the hive bins data
+    pub offset : u32,
+    /// Size of a current hive bin in bytes
+    pub size : u32,
+    pub reserved : u64,
+    /// FILETIME (UTC), defined for the first hive bin only (see below)
+    pub timestamp : u64,
+    /// Spare (or MemAlloc). This field has no meaning on a disk (see below)
+    pub spare : u32
+}
+
+
 impl From<BaseBlockW10> for BaseBlock {
     fn from(value: BaseBlockW10) -> Self {
         BaseBlock { prim_sequence: value.prim_sequence, sec_sequence: value.sec_sequence, last_written_timestamp: value.last_written_timestamp, major_version: value.major_version, minor_version: value.minor_version, file_type: value.file_type, file_format: value.file_format, root_cell_offset: value.root_cell_offset, hive_bins_data_size: value.hive_bins_data_size, clustering_factor: value.clustering_factor, file_name: value.file_name, checksum: value.checksum, boot_type: value.boot_type, boot_recovery: value.boot_recovery }
@@ -175,6 +193,13 @@ pub fn is_valid_base_block(buff : &[u8]) -> bool {
         return false
     }
     &buff[0..4] == b"regf"
+}
+
+pub fn is_hive_data(buff : &[u8]) -> bool {
+    if buff.len() != 32 {
+        return false
+    }
+    &buff[0..4] == b"hbin"
 }
 
 pub fn checksum_is_correct(buff : &[u8]) -> bool {
@@ -222,7 +247,62 @@ pub fn read_base_block(file : &mut Box<dyn VirtualFile>) -> ForensicResult<BaseB
     let base_block = &body[0];
     return Ok(base_block.into())
 }
+pub fn read_bin_header(file : &mut Box<dyn VirtualFile>) -> ForensicResult<HiveBinHeader> {
+    let mut buffer = vec![0u8;32];
+    file.read_exact(&mut buffer)?;
+    if !is_hive_data(&buffer) {
+        return Err(forensic_rs::prelude::ForensicError::BadFormat);
+    }
+    let (head, body, tail) = unsafe { buffer.align_to::<HiveBinHeader>() };
+    if head.len() != 0 || tail.len() != 0{
+        return Err(forensic_rs::prelude::ForensicError::BadFormat);
+    }
+    let header = &body[0];
+    Ok(HiveBinHeader { signature: header.signature, offset: header.offset, size: header.size, reserved: header.reserved, timestamp: header.timestamp, spare: header.spare })
+}
 
+pub fn read_hive_bin_at_file_position(file : &mut Box<dyn VirtualFile>) -> ForensicResult<(HiveBinHeader, Vec<u8>)> {
+    let initial_offset = file.stream_position().unwrap_or_default();
+    let header = match read_bin_header(file) {
+        Ok(v) => v,
+        Err(e) => {
+            file.seek(std::io::SeekFrom::Start(initial_offset))?;
+            return Err(e);
+        }
+    };
+    if header.size < 32 {
+        return Err(forensic_rs::prelude::ForensicError::BadFormat)
+    }
+    let mut buff = vec![0u8; header.size as usize - 32];
+    file.read_exact(&mut buff)?;
+    return Ok((header, buff))
+}
+
+
+pub fn read_cells(data : &[u8]) -> ForensicResult<()> {
+    let len = data.len();
+    if len < 4 {
+        return Err(forensic_rs::prelude::ForensicError::BadFormat)
+    }
+    let mut offset = 0;
+    loop {
+        if offset > len {
+            return Err(forensic_rs::prelude::ForensicError::BadFormat)
+        }else if offset == len {
+            break;
+        }
+        // Size of a current cell in bytes, including this field (aligned to 8 bytes): the size is positive if a cell is unallocated or negative if a cell is allocated (use absolute values for calculations)
+        let cell_len_i = i32::from_ne_bytes(data[offset..offset + 4].try_into().unwrap_or_default());
+        let cell_len = cell_len_i.abs() as usize;
+        if offset + cell_len > len {
+            return Err(forensic_rs::prelude::ForensicError::BadFormat)
+        }
+        let cell_data = &data[offset + 4..offset + cell_len];
+        // TODO
+        offset = offset + cell_len;
+    }
+    Ok(())
+}
 
 
 #[cfg(test)]
@@ -240,5 +320,19 @@ mod tst {
         let base_block = read_base_block(&mut sec_file).unwrap();
         assert_eq!(str_to_unicode_with_ending(b"emRoot\\System32\\Config\\SECURITY"), &base_block.file_name[0..64]);
         assert_no_notifications();
+        
+    }
+
+    #[test]
+    fn can_read_hive_data() {
+        init_tst();
+        let mut fs = init_virtual_fs();
+        let mut sam_file = read_sam_hive(&mut fs);
+        let base_block = read_base_block(&mut sam_file).unwrap();
+        assert_no_notifications();
+        // Position to 4096 + offset -32 (header)
+        sam_file.seek(std::io::SeekFrom::Start(4096 + base_block.root_cell_offset as u64 - 32)).unwrap();
+        let hive_bin = read_hive_bin_at_file_position(&mut sam_file).unwrap();
+        read_cells(&hive_bin.1).unwrap();
     }
 }

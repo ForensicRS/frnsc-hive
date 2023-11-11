@@ -5,3 +5,5 @@ Open Hive registry for forensic purpouses. Uses [ForensicRs](https://github.com/
 
 ## Status
 Still not usable, and a WIP.
+
+https://github.com/msuhanov/regf/blob/master/Windows%20registry%20file%20format%20specification.md
