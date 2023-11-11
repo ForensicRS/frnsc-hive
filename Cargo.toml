@@ -1,0 +1,13 @@
+[package]
+name = "frnsc-hive"
+version = "0.1.0"
+authors = ["Samuel Garcés Marín <samuel.garces@protonmail.com>"]
+keywords = ["forensic", "windows", "parser", "registry", "cybersecurity"]
+categories = ["parsing"]
+description = "Implements RegistryReader from forensic-rs to access the windows registry from Hive files"
+license = "MIT"
+edition = "2021"
+repository = "https://github.com/ForensicRS/frnsc-hive"
+
+[dependencies]
+forensic-rs = "0.6.1"
