@@ -8,6 +8,7 @@ description = "Implements RegistryReader from forensic-rs to access the windows 
 license = "MIT"
 edition = "2021"
 repository = "https://github.com/ForensicRS/frnsc-hive"
+exclude = ["/artifacts"]
 
 [dependencies]
 forensic-rs = "0.6.1"

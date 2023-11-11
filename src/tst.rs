@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::cell::RefCell;
 
-use forensic_rs::{traits::vfs::{VirtualFileSystem, VirtualFile}, core::fs::StdVirtualFS, notifications::Notifier, channel::Receiver, prelude::{Notification, Message}};
+use forensic_rs::{traits::vfs::{VirtualFileSystem, VirtualFile}, core::fs::StdVirtualFS, channel::Receiver, prelude::{Notification, Message}};
 
 pub(crate) fn init_virtual_fs() -> Box<dyn VirtualFileSystem> {
     Box::new(forensic_rs::core::fs::ChRootFileSystem::new("./artifacts", Box::new(StdVirtualFS::new())))

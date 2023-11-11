@@ -1,4 +1,4 @@
-use forensic_rs::{traits::vfs::VirtualFile, prelude::ForensicResult, notifications::{NotificationType, macros::*}, notify_info};
+use forensic_rs::{traits::vfs::VirtualFile, prelude::ForensicResult, notifications::NotificationType, notify_info};
 
 pub struct HivePrimaryFile {
     pub base_block : BaseBlock
