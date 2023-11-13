@@ -10,5 +10,10 @@ edition = "2021"
 repository = "https://github.com/ForensicRS/frnsc-hive"
 exclude = ["/artifacts"]
 
+[features]
+"default" = []
+"carving" = []
+
 [dependencies]
-forensic-rs = "0.6.1"
+forensic-rs = "0.6.2"
+#forensic-rs = { path = "../forensic-rs" } # Dev

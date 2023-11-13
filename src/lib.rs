@@ -1,5 +1,6 @@
 pub mod hive;
 pub mod reader;
+pub mod cell;
 
 #[cfg(test)]
 pub(crate) mod tst;

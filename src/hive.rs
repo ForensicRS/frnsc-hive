@@ -1,5 +1,7 @@
 use forensic_rs::{traits::vfs::VirtualFile, prelude::ForensicResult, notifications::NotificationType, notify_info};
 
+use crate::cell::read_cell;
+
 pub struct HivePrimaryFile {
     pub base_block : BaseBlock
 }
@@ -298,6 +300,15 @@ pub fn read_cells(data : &[u8]) -> ForensicResult<()> {
             return Err(forensic_rs::prelude::ForensicError::BadFormat)
         }
         let cell_data = &data[offset + 4..offset + cell_len];
+        let cell = match read_cell(cell_data) {
+            Ok(v) => v,
+            Err(e) => {
+                println!("Invalid Cell {:?}", e);
+                offset = offset + cell_len;
+                continue;
+            }
+        };
+        println!("{:?}", cell);
         // TODO
         offset = offset + cell_len;
     }
@@ -324,7 +335,7 @@ mod tst {
     }
 
     #[test]
-    fn can_read_hive_data() {
+    fn can_read_sam_hive_data() {
         init_tst();
         let mut fs = init_virtual_fs();
         let mut sam_file = read_sam_hive(&mut fs);
@@ -334,5 +345,30 @@ mod tst {
         sam_file.seek(std::io::SeekFrom::Start(4096 + base_block.root_cell_offset as u64 - 32)).unwrap();
         let hive_bin = read_hive_bin_at_file_position(&mut sam_file).unwrap();
         read_cells(&hive_bin.1).unwrap();
+    }
+    #[test]
+    fn can_read_security_hive_data() {
+        init_tst();
+        let mut fs = init_virtual_fs();
+        let mut sec_file = read_sec_hive(&mut fs);
+        let base_block = read_base_block(&mut sec_file).unwrap();
+        assert_no_notifications();
+        // Position to 4096 + offset -32 (header)
+        
+        let mut i = 0;
+        let mut offset = 4096 + base_block.root_cell_offset as u64 - 32;
+        
+        loop {
+            if offset >= base_block.hive_bins_data_size.into() {
+                break;
+            }
+            println!("Hive Bin {}", i);
+            i = i+1;
+            sec_file.seek(std::io::SeekFrom::Start(offset)).unwrap();
+            let hive_bin = read_hive_bin_at_file_position(&mut sec_file).unwrap();
+            read_cells(&hive_bin.1).unwrap();
+            offset += hive_bin.0.size as u64;
+        }
+        
     }
 }
