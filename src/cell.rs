@@ -37,6 +37,7 @@ pub enum HiveCell {
     KeyValue(KeyValueCell),
     KeySecurity(KeySecurityCell),
     BigData(BigDataCell),
+    Unallocated(UnallocatedCell),
     #[cfg(feature="carving")]
     /// Used only for carving data in registry cells
     Invalid(Vec<u8>)
@@ -52,9 +53,15 @@ impl HiveCell {
             HiveCell::KeyValue(v) => v.offset,
             HiveCell::KeySecurity(v) => v.offset,
             HiveCell::BigData(v) => v.offset,
+            HiveCell::Unallocated(v) => v.offset
         }
     }
 }
+#[derive(Debug,Clone)]
+pub struct UnallocatedCell {
+    pub offset : u64
+}
+
 #[derive(Debug,Clone)]
 pub struct IndexLeafCell {
     /// List of offsets of the key node elements in bytes relative from the start of the hive bins data
@@ -93,25 +100,25 @@ pub struct HashLeafListElements {
 
 impl HashLeafCell {
     pub fn hash_name(name : &str) -> u32 {
-        let mut h : u32 = 0;
+        let mut h : u64 = 0;
         if name.is_ascii() {
             for &char in name.as_bytes() {
                 let char = Self::uppercase(char);
-                h = 37 * h + (char as u32);
+                h = 37 * h + (char as u64);
             }
         }else {
             for char in name.to_ascii_uppercase().encode_utf16() {
-                h = 37 * h + (char as u32);
+                h = 37 * h + (char as u64);
             }
         }
-        h
+        h as u32
     }
 
-    pub fn uppercase(v : u8) -> u8 {
+    pub fn uppercase(v : u8) -> u64 {
         if v >= b'a' && v < b'z' {
-            b'A' + (v - b'a')
+            (b'A' + (v - b'a')) as u64
         }else {
-            v
+            v as u64
         }
     }
 }
@@ -272,7 +279,13 @@ pub struct BigDataCell {
 }
 
 pub fn read_cell(data : &[u8], offset : u64) -> ForensicResult<HiveCell> {
-    let signature = &data[0..2];
+    let cell_len_i = i32::from_ne_bytes(data[..4].try_into().unwrap_or_default());
+    let cell_len = cell_len_i.abs() as usize;
+    if cell_len_i >= 0 {
+        return Ok(HiveCell::Unallocated(UnallocatedCell { offset }))
+    }
+    let signature = &data[4..6];
+    let data = &data[4..cell_len];
     let cell = if signature == INDEX_LEAF_SIGNATURE {
         let cell = read_index_leaf_cell(data, offset)?;
         HiveCell::IndexLeaf(cell)

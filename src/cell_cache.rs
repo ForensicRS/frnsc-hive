@@ -73,7 +73,6 @@ impl CellCache {
     }
 
     pub fn get(&self, offset : u64) -> Option<&HiveCell> {
-        println!("{:?}", self.map);
         let iteration = self.increase_iteration();
         let cached = self.map.get(&offset)?;
         cached.increase_counter(iteration);
