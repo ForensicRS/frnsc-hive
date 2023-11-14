@@ -15,5 +15,5 @@ exclude = ["/artifacts"]
 "carving" = []
 
 [dependencies]
-forensic-rs = "0.6.2"
+forensic-rs = "0.7"
 #forensic-rs = { path = "../forensic-rs" } # Dev

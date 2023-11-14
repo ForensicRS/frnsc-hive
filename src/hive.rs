@@ -1,6 +1,6 @@
 use forensic_rs::{traits::vfs::VirtualFile, prelude::ForensicResult, notifications::NotificationType, notify_info};
 
-use crate::cell::read_cell;
+use crate::cell::{read_cell, HiveCell};
 
 pub struct HivePrimaryFile {
     pub base_block : BaseBlock
@@ -281,12 +281,13 @@ pub fn read_hive_bin_at_file_position(file : &mut Box<dyn VirtualFile>) -> Foren
 }
 
 
-pub fn read_cells(data : &[u8]) -> ForensicResult<()> {
+pub fn read_cells(data : &[u8], bin_offset : u64) -> ForensicResult<Vec<HiveCell>> {
     let len = data.len();
     if len < 4 {
         return Err(forensic_rs::prelude::ForensicError::BadFormat)
     }
     let mut offset = 0;
+    let mut list = Vec::with_capacity(128);
     loop {
         if offset > len {
             return Err(forensic_rs::prelude::ForensicError::BadFormat)
@@ -300,19 +301,18 @@ pub fn read_cells(data : &[u8]) -> ForensicResult<()> {
             return Err(forensic_rs::prelude::ForensicError::BadFormat)
         }
         let cell_data = &data[offset + 4..offset + cell_len];
-        let cell = match read_cell(cell_data) {
+        let cell = match read_cell(cell_data, bin_offset + offset as u64) {
             Ok(v) => v,
             Err(e) => {
-                println!("Invalid Cell {:?}", e);
                 offset = offset + cell_len;
                 continue;
             }
         };
-        println!("{:?}", cell);
+        list.push(cell);
         // TODO
         offset = offset + cell_len;
     }
-    Ok(())
+    Ok(list)
 }
 
 
@@ -344,7 +344,7 @@ mod tst {
         // Position to 4096 + offset -32 (header)
         sam_file.seek(std::io::SeekFrom::Start(4096 + base_block.root_cell_offset as u64 - 32)).unwrap();
         let hive_bin = read_hive_bin_at_file_position(&mut sam_file).unwrap();
-        read_cells(&hive_bin.1).unwrap();
+        read_cells(&hive_bin.1, 4096 + base_block.root_cell_offset as u64 - 32).unwrap();
     }
     #[test]
     fn can_read_security_hive_data() {
@@ -366,7 +366,7 @@ mod tst {
             i = i+1;
             sec_file.seek(std::io::SeekFrom::Start(offset)).unwrap();
             let hive_bin = read_hive_bin_at_file_position(&mut sec_file).unwrap();
-            read_cells(&hive_bin.1).unwrap();
+            read_cells(&hive_bin.1, offset - 4064 - base_block.root_cell_offset as u64).unwrap();
             offset += hive_bin.0.size as u64;
         }
         

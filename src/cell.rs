@@ -27,7 +27,7 @@ pub const VALUE_COMP_NAME_FLAG : u16 = 0x0001;
 /// Is a tombstone value (the flag is used starting from Insider Preview builds of Windows 10 "Redstone 1"), a tombstone value also has the Data type field set to REG_NONE, the Data size field set to 0, and the Data offset field set to 0xFFFFFFFF
 pub const VALUE_IS_TOMBSTONE : u16 = 0x0002;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum HiveCell {
     IndexLeaf(IndexLeafCell),
     FastLeaf(FastLeafCell),
@@ -41,53 +41,96 @@ pub enum HiveCell {
     /// Used only for carving data in registry cells
     Invalid(Vec<u8>)
 }
-#[derive(Debug)]
+impl HiveCell {
+    pub fn offset(&self) -> u64 {
+        match self {
+            HiveCell::IndexLeaf(v) => v.offset,
+            HiveCell::FastLeaf(v) => v.offset,
+            HiveCell::HashLeaf(v) => v.offset,
+            HiveCell::IndexRoot(v) => v.offset,
+            HiveCell::KeyNode(v) => v.offset,
+            HiveCell::KeyValue(v) => v.offset,
+            HiveCell::KeySecurity(v) => v.offset,
+            HiveCell::BigData(v) => v.offset,
+        }
+    }
+}
+#[derive(Debug,Clone)]
 pub struct IndexLeafCell {
     /// List of offsets of the key node elements in bytes relative from the start of the hive bins data
-    pub elements : Vec<IndexLeafListElements>
+    pub elements : Vec<IndexLeafListElements>,
+    pub offset : u64
 }
-#[derive(Debug)]
+#[derive(Debug,Clone)]
 pub struct IndexLeafListElements {
     /// Key node element offset in bytes relative from the start of the hive bins data
     pub offset : u32
 }
-#[derive(Debug)]
+#[derive(Debug,Clone)]
 pub struct FastLeafCell {
-    pub elements : Vec<FastLeafListElements>
+    pub elements : Vec<FastLeafListElements>,
+    pub offset : u64
 }
-#[derive(Debug)]
+#[derive(Debug,Clone)]
 pub struct FastLeafListElements {
     /// Key node offset: In bytes, relative from the start of the hive bins data
     pub offset : u32,
     /// The first 4 ASCII characters of a key name string (used to speed up lookups)
-    pub name_hint : [u8; 4]
+    pub name_hint : String
 }
-#[derive(Debug)]
+#[derive(Debug,Clone)]
 pub struct HashLeafCell {
-    pub elements : Vec<HashLeafListElements>
+    pub elements : Vec<HashLeafListElements>,
+    pub offset : u64
 }
-#[derive(Debug)]
+#[derive(Debug,Clone)]
 pub struct HashLeafListElements {
     /// Key node offset: In bytes, relative from the start of the hive bins data
     pub offset : u32,
-    /// The first 4 ASCII characters of a key name string (used to speed up lookups)
-    pub name_hint : [u8; 4]
+    /// Hash of a key name string, see below (used to speed up lookups)
+    pub name_hash : u32
+}
+
+impl HashLeafCell {
+    pub fn hash_name(name : &str) -> u32 {
+        let mut h : u32 = 0;
+        if name.is_ascii() {
+            for &char in name.as_bytes() {
+                let char = Self::uppercase(char);
+                h = 37 * h + (char as u32);
+            }
+        }else {
+            for char in name.to_ascii_uppercase().encode_utf16() {
+                h = 37 * h + (char as u32);
+            }
+        }
+        h
+    }
+
+    pub fn uppercase(v : u8) -> u8 {
+        if v >= b'a' && v < b'z' {
+            b'A' + (v - b'a')
+        }else {
+            v
+        }
+    }
 }
 
 /// An Index root can't point to another Index root.
 /// A subkeys list can't point to an Index root.
 /// List elements within subkeys lists referenced by a single Index root must be sorted as a whole.
-#[derive(Debug)]
+#[derive(Debug,Clone)]
 pub struct IndexRootCell {
-    pub elements : Vec<IndexRootSubkeyOffset>
+    pub elements : Vec<IndexRootSubkeyOffset>,
+    pub offset : u64
 }
-#[derive(Debug)]
+#[derive(Debug,Clone)]
 pub struct IndexRootSubkeyOffset {
     /// Subkeys list offset: In bytes, relative from the start of the hive bins data
     pub subkeys_list_offset : u32,
 }
 
-#[derive(Debug)]
+#[derive(Debug,Clone)]
 pub struct KeyNodeCell {
     /// Flags. Bit mask, see below
     pub flags : u16,
@@ -133,7 +176,8 @@ pub struct KeyNodeCell {
     /// Class name length. In bytes
     pub class_name_length : u16,
     /// ASCII (extended) string or UTF-16LE string
-    pub key_name : String
+    pub key_name : String,
+    pub offset : u64
 }
 
 #[repr(C,packed)]
@@ -184,7 +228,7 @@ pub struct KeyNodeCellPacked {
     /// Class name length. In bytes
     pub class_name_length : u16,
 }
-#[derive(Debug)]
+#[derive(Debug,Clone)]
 pub struct KeyValueCell {
     pub name_length : u16,
     pub data_size : u32,
@@ -192,6 +236,7 @@ pub struct KeyValueCell {
     pub data_type: u32,
     pub flags : u16,
     pub value_name : String,
+    pub offset : u64
 }
 #[repr(C, packed)]
 pub struct KeyValueCellPacked {
@@ -203,13 +248,14 @@ pub struct KeyValueCellPacked {
     pub flags : u16,
     pub spare : u16,
 }
-#[derive(Debug)]
+#[derive(Debug,Clone)]
 pub struct KeySecurityCell {
     pub flink : u32,
     pub blink : u32,
     pub ref_count : u32,
     pub sec_desc_size : u32,
-    pub sec_desc : Vec<u8>
+    pub sec_desc : Vec<u8>,
+    pub offset : u64
 }
 #[repr(C, packed)]
 pub struct KeySecurityCellPacked{
@@ -220,33 +266,33 @@ pub struct KeySecurityCellPacked{
     pub ref_count : u32,
     pub sec_desc_size : u32
 }
-#[derive(Debug)]
+#[derive(Debug,Clone)]
 pub struct BigDataCell {
-
+    pub offset : u64
 }
 
-pub fn read_cell(data : &[u8]) -> ForensicResult<HiveCell> {
+pub fn read_cell(data : &[u8], offset : u64) -> ForensicResult<HiveCell> {
     let signature = &data[0..2];
     let cell = if signature == INDEX_LEAF_SIGNATURE {
-        let cell = read_index_leaf_cell(data)?;
+        let cell = read_index_leaf_cell(data, offset)?;
         HiveCell::IndexLeaf(cell)
     }else if signature == FAST_LEAF_SIGNATURE {
-        let cell = read_fast_leaf_cell(data)?;
+        let cell = read_fast_leaf_cell(data, offset)?;
         HiveCell::FastLeaf(cell)
     }else if signature == HASH_LEAF_SIGNATURE {
-        let cell = read_hash_leaf_cell(data)?;
+        let cell = read_hash_leaf_cell(data, offset)?;
         HiveCell::HashLeaf(cell)
     }else if signature == INDEX_ROOT_SIGNATURE {
-        let cell = read_index_root_cell(data)?;
+        let cell = read_index_root_cell(data, offset)?;
         HiveCell::IndexRoot(cell)
     }else if signature == KEY_NODE_SIGNATURE {
-        let cell = read_key_node_cell(data)?;
+        let cell = read_key_node_cell(data, offset)?;
         HiveCell::KeyNode(cell)
     }else if signature == KEY_SECURITY_SIGNATURE {
-        let cell = read_key_security_cell(data)?;
+        let cell = read_key_security_cell(data, offset)?;
         HiveCell::KeySecurity(cell)
     }else if signature == KEY_VALUE_SIGNATURE {
-        let cell = read_key_value_cell(data)?;
+        let cell = read_key_value_cell(data, offset)?;
         HiveCell::KeyValue(cell)
     }else {
         #[cfg(feature="carving")]
@@ -257,7 +303,7 @@ pub fn read_cell(data : &[u8]) -> ForensicResult<HiveCell> {
     Ok(cell)
 }
 
-pub fn read_index_leaf_cell(data :&[u8]) -> ForensicResult<IndexLeafCell> {
+pub fn read_index_leaf_cell(data :&[u8], offset : u64) -> ForensicResult<IndexLeafCell> {
     let signature = &data[0..2];
     if signature != INDEX_LEAF_SIGNATURE {
         return Err(forensic_rs::prelude::ForensicError::BadFormat)
@@ -272,10 +318,10 @@ pub fn read_index_leaf_cell(data :&[u8]) -> ForensicResult<IndexLeafCell> {
         let offset = u32::from_ne_bytes(data[i..i + 4].try_into().unwrap_or_default());
         offset_list.push(IndexLeafListElements {offset});
     }
-    Ok(IndexLeafCell { elements: offset_list })
+    Ok(IndexLeafCell { elements: offset_list, offset })
 }
 
-pub fn read_fast_leaf_cell(data :&[u8]) -> ForensicResult<FastLeafCell> {
+pub fn read_fast_leaf_cell(data :&[u8], offset : u64) -> ForensicResult<FastLeafCell> {
     let signature = &data[0..2];
     if signature != FAST_LEAF_SIGNATURE {
         return Err(forensic_rs::prelude::ForensicError::BadFormat)
@@ -288,12 +334,17 @@ pub fn read_fast_leaf_cell(data :&[u8]) -> ForensicResult<FastLeafCell> {
     let mut offset_list = Vec::with_capacity(n_elements.into());
     for i in (4..(4 + 8*n_elements as usize)).step_by(8) {
         let offset = u32::from_ne_bytes(data[i..i + 4].try_into().unwrap_or_default());
-        offset_list.push(FastLeafListElements {offset, name_hint : [data[i], data[i + 1], data[i + 2], data[i + 3]]});
+        let data_end = match data[i + 4..i + 8].iter().position(|&v| v == 0) {
+            Some(v) => i + 4 + v,
+            None => i + 8
+        };
+        let txt = String::from_utf8_lossy(&data[i+4..data_end]).to_string();
+        offset_list.push(FastLeafListElements {offset, name_hint : txt});
     }
-    Ok(FastLeafCell { elements: offset_list })
+    Ok(FastLeafCell { elements: offset_list, offset })
 }
 
-pub fn read_hash_leaf_cell(data :&[u8]) -> ForensicResult<HashLeafCell> {
+pub fn read_hash_leaf_cell(data :&[u8], offset : u64) -> ForensicResult<HashLeafCell> {
     let signature = &data[0..2];
     if signature != HASH_LEAF_SIGNATURE {
         return Err(forensic_rs::prelude::ForensicError::BadFormat)
@@ -306,12 +357,13 @@ pub fn read_hash_leaf_cell(data :&[u8]) -> ForensicResult<HashLeafCell> {
     let mut offset_list = Vec::with_capacity(n_elements.into());
     for i in (4..total_size_elements).step_by(8) {
         let offset = u32::from_ne_bytes(data[i..i + 4].try_into().unwrap_or_default());
-        offset_list.push(HashLeafListElements {offset, name_hint : [data[i + 4], data[i + 5], data[i + 6], data[i + 7]]});
+        let name_hash = u32::from_ne_bytes(data[i + 4..i + 8].try_into().unwrap_or_default());
+        offset_list.push(HashLeafListElements {offset, name_hash});
     }
-    Ok(HashLeafCell { elements: offset_list })
+    Ok(HashLeafCell { elements: offset_list, offset })
 }
 
-pub fn read_index_root_cell(data :&[u8]) -> ForensicResult<IndexRootCell> {
+pub fn read_index_root_cell(data :&[u8], offset : u64) -> ForensicResult<IndexRootCell> {
     let signature = &data[0..2];
     if signature != INDEX_ROOT_SIGNATURE {
         return Err(forensic_rs::prelude::ForensicError::BadFormat)
@@ -326,10 +378,10 @@ pub fn read_index_root_cell(data :&[u8]) -> ForensicResult<IndexRootCell> {
         let offset = u32::from_ne_bytes(data[i..i + 4].try_into().unwrap_or_default());
         offset_list.push(IndexRootSubkeyOffset { subkeys_list_offset : offset});
     }
-    Ok(IndexRootCell { elements: offset_list })
+    Ok(IndexRootCell { elements: offset_list, offset })
 }
 
-pub fn read_key_node_cell(data :&[u8]) -> ForensicResult<KeyNodeCell> {
+pub fn read_key_node_cell(data :&[u8], offset : u64) -> ForensicResult<KeyNodeCell> {
     let signature = &data[0..2];
     if signature != KEY_NODE_SIGNATURE {
         return Err(forensic_rs::prelude::ForensicError::BadFormat)
@@ -340,6 +392,7 @@ pub fn read_key_node_cell(data :&[u8]) -> ForensicResult<KeyNodeCell> {
     }
     let packed_cell = &body[0];
     let mut cell: KeyNodeCell = packed_cell.into();
+    cell.offset = offset;
     if 76 + cell.key_name_length as usize > data.len() {
         return Err(forensic_rs::prelude::ForensicError::BadFormat);
     }
@@ -355,7 +408,7 @@ pub fn read_key_node_cell(data :&[u8]) -> ForensicResult<KeyNodeCell> {
     Ok(cell)
 }
 
-pub fn read_key_security_cell(data :&[u8]) -> ForensicResult<KeySecurityCell> {
+pub fn read_key_security_cell(data :&[u8], offset : u64) -> ForensicResult<KeySecurityCell> {
     let signature = &data[0..2];
     if signature != KEY_SECURITY_SIGNATURE {
         return Err(forensic_rs::prelude::ForensicError::BadFormat)
@@ -366,6 +419,7 @@ pub fn read_key_security_cell(data :&[u8]) -> ForensicResult<KeySecurityCell> {
     }
     let packed_cell = &body[0];
     let mut cell: KeySecurityCell = packed_cell.into();
+    cell.offset = offset;
     let sec_end_pos = 20 + cell.sec_desc_size as usize;
     if sec_end_pos > data.len() {
         return Err(forensic_rs::prelude::ForensicError::BadFormat);
@@ -376,7 +430,7 @@ pub fn read_key_security_cell(data :&[u8]) -> ForensicResult<KeySecurityCell> {
     Ok(cell)
 }
 
-pub fn read_key_value_cell(data :&[u8]) -> ForensicResult<KeyValueCell> {
+pub fn read_key_value_cell(data :&[u8], offset : u64) -> ForensicResult<KeyValueCell> {
     let signature = &data[0..2];
     if signature != KEY_VALUE_SIGNATURE {
         return Err(forensic_rs::prelude::ForensicError::BadFormat)
@@ -387,6 +441,7 @@ pub fn read_key_value_cell(data :&[u8]) -> ForensicResult<KeyValueCell> {
     }
     let packed_cell = &body[0];
     let mut cell: KeyValueCell = packed_cell.into();
+    cell.offset = offset;
     let value_name_end = 20 + cell.name_length as usize;
     if value_name_end > data.len() {
         return Err(forensic_rs::prelude::ForensicError::BadFormat);
@@ -430,6 +485,7 @@ impl From<KeyNodeCellPacked> for KeyNodeCell {
             key_name_length: v.key_name_length,
             class_name_length: v.class_name_length,
             key_name: String::new(),
+            offset : 0
         }
     }
 }
@@ -458,6 +514,7 @@ impl From<&KeyNodeCellPacked> for KeyNodeCell {
             key_name_length: v.key_name_length,
             class_name_length: v.class_name_length,
             key_name: String::new(),
+            offset : 0
         }
     }
 }
@@ -469,7 +526,8 @@ impl From<KeySecurityCellPacked> for KeySecurityCell {
             flink : v.flink,
             ref_count :v.ref_count,
             sec_desc : Vec::with_capacity(v.sec_desc_size as usize),
-            sec_desc_size : v.sec_desc_size
+            sec_desc_size : v.sec_desc_size,
+            offset : 0
         }
     }
 }
@@ -480,7 +538,8 @@ impl From<&KeySecurityCellPacked> for KeySecurityCell {
             flink : v.flink,
             ref_count :v.ref_count,
             sec_desc : Vec::with_capacity(v.sec_desc_size as usize),
-            sec_desc_size : v.sec_desc_size
+            sec_desc_size : v.sec_desc_size,
+            offset : 0
         }
     }
 }
@@ -492,7 +551,8 @@ impl From<KeyValueCellPacked> for KeyValueCell {
             data_offset: v.data_offset,
             data_type: v.data_type,
             flags: v.flags,
-            value_name: String::new()
+            value_name: String::new(),
+            offset : 0
         }
     }
 }
@@ -504,7 +564,20 @@ impl From<&KeyValueCellPacked> for KeyValueCell {
             data_offset: v.data_offset,
             data_type: v.data_type,
             flags: v.flags,
-            value_name: String::new()
+            value_name: String::new(),
+            offset : 0
         }
+    }
+}
+
+#[cfg(test)]
+mod tst {
+    use crate::cell::HashLeafCell;
+
+    #[test]
+    fn should_hash_sam_name() {
+        assert_eq!(116109, HashLeafCell::hash_name("SAM"));
+        assert_eq!(116109, HashLeafCell::hash_name("sam"));
+        assert_eq!(116109, HashLeafCell::hash_name("SaM"));
     }
 }

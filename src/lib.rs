@@ -1,6 +1,7 @@
 pub mod hive;
 pub mod reader;
 pub mod cell;
+pub(crate) mod cell_cache;
 
 #[cfg(test)]
 pub(crate) mod tst;
