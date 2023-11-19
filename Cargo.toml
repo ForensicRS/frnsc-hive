@@ -12,7 +12,6 @@ exclude = ["/artifacts"]
 
 [features]
 "default" = []
-"carving" = []
 
 [dependencies]
 forensic-rs = "0.7"

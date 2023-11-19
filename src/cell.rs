@@ -38,9 +38,7 @@ pub enum HiveCell {
     KeySecurity(KeySecurityCell),
     BigData(BigDataCell),
     Unallocated(UnallocatedCell),
-    #[cfg(feature="carving")]
-    /// Used only for carving data in registry cells
-    Invalid(Vec<u8>)
+    Invalid(InvalidCell)
 }
 impl HiveCell {
     pub fn offset(&self) -> u64 {
@@ -53,13 +51,20 @@ impl HiveCell {
             HiveCell::KeyValue(v) => v.offset,
             HiveCell::KeySecurity(v) => v.offset,
             HiveCell::BigData(v) => v.offset,
-            HiveCell::Unallocated(v) => v.offset
+            HiveCell::Unallocated(v) => v.offset,
+            HiveCell::Invalid(v) => v.offset,
         }
     }
 }
 #[derive(Debug,Clone)]
 pub struct UnallocatedCell {
     pub offset : u64
+}
+
+#[derive(Debug,Clone)]
+pub struct InvalidCell {
+    pub offset : u64,
+    pub content : Vec<u8>
 }
 
 #[derive(Debug,Clone)]
@@ -100,25 +105,25 @@ pub struct HashLeafListElements {
 
 impl HashLeafCell {
     pub fn hash_name(name : &str) -> u32 {
-        let mut h : u64 = 0;
+        let mut h : u32 = 0;
         if name.is_ascii() {
             for &char in name.as_bytes() {
                 let char = Self::uppercase(char);
-                h = 37 * h + (char as u64);
+                h = 37u32.wrapping_mul(h).wrapping_add(char as u32);
             }
         }else {
             for char in name.to_ascii_uppercase().encode_utf16() {
-                h = 37 * h + (char as u64);
+                h = 37u32.wrapping_mul(h).wrapping_add(char as u32);
             }
         }
         h as u32
     }
 
-    pub fn uppercase(v : u8) -> u64 {
+    pub fn uppercase(v : u8) -> u32 {
         if v >= b'a' && v < b'z' {
-            (b'A' + (v - b'a')) as u64
+            (b'A' + (v - b'a')) as u32
         }else {
-            v as u64
+            v as u32
         }
     }
 }
@@ -308,10 +313,7 @@ pub fn read_cell(data : &[u8], offset : u64) -> ForensicResult<HiveCell> {
         let cell = read_key_value_cell(data, offset)?;
         HiveCell::KeyValue(cell)
     }else {
-        #[cfg(feature="carving")]
-        return Ok(HiveCell::Invalid(Vec::from(data)));
-        #[cfg(not(feature="carving"))]
-        return Err(forensic_rs::prelude::ForensicError::Other(format!("Invalid format signature: {}", String::from_utf8_lossy(signature))));
+        HiveCell::Invalid(InvalidCell { offset, content : data[..].to_vec() })
     };
     Ok(cell)
 }
@@ -473,6 +475,7 @@ pub fn read_key_value_cell(data :&[u8], offset : u64) -> ForensicResult<KeyValue
     Ok(cell)
 }
 
+
 impl From<KeyNodeCellPacked> for KeyNodeCell {
     fn from(v: KeyNodeCellPacked) -> Self {
         KeyNodeCell {
@@ -580,6 +583,40 @@ impl From<&KeyValueCellPacked> for KeyValueCell {
             value_name: String::new(),
             offset : 0
         }
+    }
+}
+
+impl InvalidCell {
+    pub fn into_reg_sz_extended(&self) -> String {
+        let s: &[u16] = unsafe { std::slice::from_raw_parts(self.content.as_ptr() as *const _, self.content.len()/2) };
+        String::from_utf16_lossy(s)
+    }
+    pub fn into_reg_sz_ascii(&self) -> String {
+        String::from_utf8_lossy(&self.content).to_string()
+    }
+    pub fn into_dword(&self) -> u32 {
+        if self.content.len() != 4 {
+            return 0
+        }
+        u32::from_ne_bytes(self.content[0..4].try_into().unwrap_or_default())
+    }
+    pub fn into_dword_le(&self) -> u32 {
+        if self.content.len() != 4 {
+            return 0
+        }
+        u32::from_le_bytes(self.content[0..4].try_into().unwrap_or_default())
+    }
+    pub fn into_dword_be(&self) -> u32 {
+        if self.content.len() != 4 {
+            return 0
+        }
+        u32::from_be_bytes(self.content[0..4].try_into().unwrap_or_default())
+    }
+    pub fn into_qword_le(&self) -> u64 {
+        if self.content.len() != 8 {
+            return 0
+        }
+        u64::from_le_bytes(self.content[0..8].try_into().unwrap_or_default())
     }
 }
 

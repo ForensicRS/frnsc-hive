@@ -378,7 +378,6 @@ mod tst {
             if offset >= base_block.hive_bins_data_size.into() {
                 break;
             }
-            println!("Hive Bin {}", i);
             i = i+1;
             sec_file.seek(std::io::SeekFrom::Start(offset)).unwrap();
             let hive_bin = read_hive_bin_at_file_position(&mut sec_file).unwrap();
