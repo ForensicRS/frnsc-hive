@@ -1,5 +1,5 @@
 use super::*;
-use forensic_rs::{core::fs::ChRootFileSystem, notifications, traits::vfs::VirtualFileSystem};
+use forensic_rs::{core::fs::ChRootFileSystem, notifications, traits::{vfs::VirtualFileSystem, registry::HKU}};
 
 use crate::{hive::read_base_block, tst::*};
 
@@ -58,11 +58,12 @@ fn should_enumerate_values_in_sam_hive() {
 
 #[test]
 fn should_load_hives_from_fs() {
+    init_tst_with_notifier();
     let mut reader = HiveRegistryReader::new()
         .from_fs(init_virtual_fs())
         .unwrap();
     enumerate_keys_test(&mut reader);
-    
+    open_keys_user_super_secret_admin(&mut reader);
 }
 
 
@@ -115,4 +116,13 @@ fn open_keys_sam_hive(reader : &mut Box<dyn RegistryReader>) {
     assert_eq!("maria.feliz.secret", users[3]);
     assert_eq!("pepe.contento.secret", users[4]);
     assert_eq!("SuperSecretAdmin", users[5]);
+}
+
+fn open_keys_user_super_secret_admin(reader : &mut Box<dyn RegistryReader>) {
+    let user_names_key = reader
+        .open_key(HKU, r"S-1-5-21-3656677704-2377210397-1510584988-1004")
+        .expect("Should open SuperSecretAdmin profile");
+    let admin_keys = reader.enumerate_keys(user_names_key).expect("Should enumerate all user profiles");
+    assert_eq!(vec!["AppEvents", "Console", "Control Panel", "Environment", "EUDC", "Keyboard Layout", "Network", "Printers", "SOFTWARE", "System"], admin_keys);
+    // Volatile Environment is populated when logon
 }

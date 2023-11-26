@@ -589,10 +589,28 @@ impl From<&KeyValueCellPacked> for KeyValueCell {
 impl InvalidCell {
     pub fn into_reg_sz_extended(&self) -> String {
         let s: &[u16] = unsafe { std::slice::from_raw_parts(self.content.as_ptr() as *const _, self.content.len()/2) };
-        String::from_utf16_lossy(s)
+        let first_zero = match s.iter().rev().position(|&v| v == 0) {
+            Some(v) => s.len() - v,
+            None => s.len()
+        };
+        let last_zero = match s[0..first_zero].iter().rev().position(|&v| v != 0) {
+            Some(v) => first_zero - v,
+            None => s.len()
+        };
+        let ret = String::from_utf16_lossy(&s[..last_zero]);
+        ret
     }
     pub fn into_reg_sz_ascii(&self) -> String {
-        String::from_utf8_lossy(&self.content).to_string()
+        let first_zero = match self.content.iter().rev().position(|&v| v == 0) {
+            Some(v) => self.content.len() - v,
+            None => self.content.len()
+        };
+        let last_zero = match self.content[0..first_zero].iter().rev().position(|&v| v != 0) {
+            Some(v) => first_zero - v,
+            None => self.content.len()
+        };
+        let ret = String::from_utf8_lossy(&self.content[..last_zero]).to_string();
+        ret
     }
     pub fn into_dword(&self) -> u32 {
         if self.content.len() != 4 {

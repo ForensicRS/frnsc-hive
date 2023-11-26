@@ -4,14 +4,20 @@ use std::cell::RefCell;
 use forensic_rs::{traits::vfs::{VirtualFileSystem, VirtualFile}, core::fs::StdVirtualFS, channel::Receiver, prelude::{Notification, Message}};
 
 pub(crate) fn init_virtual_fs() -> Box<dyn VirtualFileSystem> {
-    Box::new(forensic_rs::core::fs::ChRootFileSystem::new("./artifacts", Box::new(StdVirtualFS::new())))
+    Box::new(forensic_rs::core::fs::ChRootFileSystem::new("./artifacts/", Box::new(StdVirtualFS::new())))
 }
 
 pub(crate) fn read_sam_hive(fs : &mut Box<dyn VirtualFileSystem>) -> Box<dyn VirtualFile> {
-    fs.open(Path::new("SAM")).unwrap()
+    fs.open(Path::new("C/Windows/System32/Config/SAM")).unwrap()
 }
 pub(crate) fn read_sec_hive(fs : &mut Box<dyn VirtualFileSystem>) -> Box<dyn VirtualFile> {
-    fs.open(Path::new("SECURITY")).unwrap()
+    fs.open(Path::new("C/Windows/System32/Config/SECURITY")).unwrap()
+}
+pub(crate) fn read_software_hive(fs : &mut Box<dyn VirtualFileSystem>) -> Box<dyn VirtualFile> {
+    fs.open(Path::new("C/Windows/System32/Config/SOFTWARE")).unwrap()
+}
+pub(crate) fn read_supersecretadmin_hive(fs : &mut Box<dyn VirtualFileSystem>) -> Box<dyn VirtualFile> {
+    fs.open(Path::new("C/Users/SuperSecretAdmin/NTUSER.DAT")).unwrap()
 }
 
 pub fn str_to_unicode_with_ending(txt: &[u8]) -> Vec<u8> {
@@ -52,7 +58,40 @@ pub fn init_tst() {
     let rcv = forensic_rs::notifications::testing_notifier_dummy();
     initialize_receiver(rcv);
     let rcv = forensic_rs::logging::testing_logger_dummy();
-    initialize_logger(rcv);
+    std::thread::spawn(move || {
+        loop {
+            let msg = match rcv.recv() {
+                Ok(v) => v,
+                Err(_) => return
+            };
+            println!("{:?} - {} - {}:{} - {}", msg.level, msg.module, msg.file, msg.line, msg.data);
+        }
+    });
+    //initialize_logger(rcv);
+}
+pub fn init_tst_with_notifier() {
+    let rcv = forensic_rs::notifications::testing_notifier_dummy();
+    std::thread::spawn(move || {
+        loop {
+            let msg = match rcv.recv() {
+                Ok(v) => v,
+                Err(_) => return
+            };
+            println!("{:?} - {} - {}:{} - {}", msg.r#type, msg.module, msg.file, msg.line, msg.data);
+        }
+    });
+    let rcv = forensic_rs::logging::testing_logger_dummy();
+    std::thread::spawn(move || {
+        loop {
+            let msg = match rcv.recv() {
+                Ok(v) => v,
+                Err(_) => return
+            };
+            println!("{:?} - {} - {}:{} - {}", msg.level, msg.module, msg.file, msg.line, msg.data);
+        }
+    });
+    
+    //initialize_logger(rcv);
 }
 
 /// Initializes the Receiver to simplify testing

@@ -17,6 +17,7 @@ pub struct CachedCell {
 }
 
 impl CachedCell {
+    #[allow(unused)]
     pub fn new(cell : HiveCell) -> Self {
         Self {
             cell,
