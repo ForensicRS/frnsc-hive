@@ -28,7 +28,7 @@ fn should_cache_reg_value() {
     let key = reader
         .open_key(HKLM, r"HARDWARE\DESCRIPTION\System")
         .unwrap();
-    assert_eq!(RegHiveKey::Hkey(-1), key);
+    assert_eq!(RegHiveKey::Hkey(1407374883553280), key);
     assert_eq!(
         RegValue::SZ(r"AT/AT COMPATIBLE".into()),
         reader.read_value(key, "Identifier").unwrap()
@@ -58,6 +58,15 @@ fn should_enumerate_values_in_sam_hive() {
 
 #[test]
 fn should_load_hives_from_fs() {
+    init_tst_with_notifier();
+    let mut reader = HiveRegistryReader::new()
+        .from_fs(init_virtual_fs())
+        .unwrap();
+    enumerate_keys_test(&mut reader);
+}
+#[test]
+#[ignore]
+fn should_load_hives_from_fs_in_local() {
     init_tst_with_notifier();
     let mut reader = HiveRegistryReader::new()
         .from_fs(init_virtual_fs())
