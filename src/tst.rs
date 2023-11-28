@@ -8,16 +8,16 @@ pub(crate) fn init_virtual_fs() -> Box<dyn VirtualFileSystem> {
 }
 
 pub(crate) fn read_sam_hive(fs : &mut Box<dyn VirtualFileSystem>) -> Box<dyn VirtualFile> {
-    fs.open(Path::new("C/Windows/System32/Config/SAM")).unwrap()
+    fs.open(Path::new("C:\\Windows\\System32\\Config\\SAM")).unwrap()
 }
 pub(crate) fn read_sec_hive(fs : &mut Box<dyn VirtualFileSystem>) -> Box<dyn VirtualFile> {
-    fs.open(Path::new("C/Windows/System32/Config/SECURITY")).unwrap()
+    fs.open(Path::new("C:\\Windows\\System32\\Config\\SECURITY")).unwrap()
 }
 pub(crate) fn read_software_hive(fs : &mut Box<dyn VirtualFileSystem>) -> Box<dyn VirtualFile> {
-    fs.open(Path::new("C/Windows/System32/Config/SOFTWARE")).unwrap()
+    fs.open(Path::new("C:\\Windows\\System32\\Config\\SOFTWARE")).unwrap()
 }
 pub(crate) fn read_supersecretadmin_hive(fs : &mut Box<dyn VirtualFileSystem>) -> Box<dyn VirtualFile> {
-    fs.open(Path::new("C/Users/SuperSecretAdmin/NTUSER.DAT")).unwrap()
+    fs.open(Path::new("C:\\Users\\SuperSecretAdmin\\NTUSER.DAT")).unwrap()
 }
 
 pub fn str_to_unicode_with_ending(txt: &[u8]) -> Vec<u8> {
