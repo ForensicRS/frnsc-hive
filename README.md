@@ -17,7 +17,7 @@ let mut reader = HiveRegistryReader::new();
 reader.add_reg_key(r"HKEY_LOCAL_MACHINE\HARDWARE\DESCRIPTION\System", r"Identifier", RegValue::SZ(r"AT/AT COMPATIBLE".into()));
 // Now the key is mounted and can be accesses like its in a Hive
 let key = reader.open_key(HKLM, r"HARDWARE\DESCRIPTION\System").unwrap();
-assert_eq!(RegHiveKey::Hkey(-1), key);// Negative handles = mounted keys
+assert_eq!(RegHiveKey::Hkey(1407374883553280), key); // Cache -1 and type 5 => Mounted
 assert_eq!(RegValue::SZ(r"AT/AT COMPATIBLE".into()), reader.read_value(key, "Identifier").unwrap());
 reader.close_key(key);
 ```

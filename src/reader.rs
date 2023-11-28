@@ -64,10 +64,20 @@ pub struct HiveReader {
 }
 
 impl HiveRegistryReader {
+    /// Loads all hives from the file system searching for its locations.
+    /// It also search for the location of the hives of all the users using the SOFTWARE hive with the **ProfileList** key.
+    /// ```
+    /// use forensic_rs::core::fs::{ChRootFileSystem, StdVirtualFS};
+    /// use frnsc_hive::reader::HiveRegistryReader;
+    /// // Initialize a ChRoot FS to make the folder ./artifacts/ the root folder
+    /// let fs = Box::new(ChRootFileSystem::new("./artifacts/", Box::new(StdVirtualFS::new())));
+    /// // The hive registry reader searchs for hives in C:\Windows\System32\Config that its translated into ./artifacts/C/Windows/System32/Config
+    /// let mut reader = HiveRegistryReader::from_fs(fs).unwrap();
+    /// ```
     pub fn from_fs(mut fs: Box<dyn VirtualFileSystem>,
     ) -> ForensicResult<Box<dyn RegistryReader>> {
         let mut reader = Self::new();
-        let config_folder = std::path::Path::new("C\\Windows\\System32\\Config");
+        let config_folder = std::path::Path::new("C:\\Windows\\System32\\Config");
         if let Some(hive) = open_hive_with_logs(&mut fs, config_folder, "SYSTEM") {
             reader.set_system(hive);
         }
@@ -103,7 +113,7 @@ impl HiveRegistryReader {
         }
     }
 
-    /// This method loads from the 
+    /// Searchs and loads all the users that have HIVES using the **ProfileList** registry key.
     pub fn load_user_hives(&mut self, fs : &mut Box<dyn VirtualFileSystem>) -> ForensicResult<()> {
         let system_root = match self.get_system_root() {
             Ok(v) => v,
@@ -150,30 +160,44 @@ impl HiveRegistryReader {
         }
         Ok(())
     }
-
+    /// Sets the SAM HIVE
     pub fn set_sam(&mut self, hive: HiveFiles) {
         trace!("Loaded SAM hive");
         self.sam = Some(RefCell::new(hive));
     }
+    /// Sets the SECURITY HIVE
     pub fn set_security(&mut self, hive: HiveFiles) {
         trace!("Loaded Security hive");
         self.security = Some(RefCell::new(hive));
     }
+    /// Sets the SOFTWARE HIVE
     pub fn set_software(&mut self, hive: HiveFiles) {
         trace!("Loaded Software hive");
         self.software = Some(RefCell::new(hive));
     }
+    /// Sets the SYSTEM HIVE
     pub fn set_system(&mut self, hive: HiveFiles) {
         trace!("Loaded System hive");
         self.system = Some(RefCell::new(hive));
     }
+    /// Sets the CurrentConfig HIVE
     pub fn set_current_config(&mut self, hive: HiveFiles) {
         self.current_config = Some(RefCell::new(hive));
     }
+    /// Adds a User HIVE. The user parameter must be the GUID of the user.
     pub fn add_user(&mut self, user: &str, hive: HiveFiles) {
         trace!("Added user {} hive", user);
         self.users.push((user.into(), RefCell::new(hive)));
     }
+    /// Adds a registry key extracted from a REG file
+    /// ```
+    /// use frnsc_hive::reader::HiveRegistryReader;
+    /// use forensic_rs::prelude::{RegValue, RegistryReader, HKLM};
+    /// let mut reader = HiveRegistryReader::new();
+    /// reader.add_reg_key(r"HKEY_LOCAL_MACHINE\HARDWARE\DESCRIPTION\System", r"Identifier", RegValue::SZ(r"AT/AT COMPATIBLE".into()));
+    /// let key = reader.open_key(HKLM, r"HARDWARE\DESCRIPTION\System").unwrap();
+    /// assert_eq!(RegValue::SZ(r"AT/AT COMPATIBLE".into()), reader.read_value(key, "Identifier").unwrap());
+    /// ```
     pub fn add_reg_key(&mut self, full_path: &str, value: &str, data: RegValue) {
         let (hkey, path) = match full_path.split_once(|v| v == '/' || v == '\\') {
             Some(v) => v,
