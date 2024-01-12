@@ -1,5 +1,8 @@
 use super::*;
-use forensic_rs::{core::fs::ChRootFileSystem, notifications, traits::{vfs::VirtualFileSystem, registry::HKU}};
+use forensic_rs::{
+    notifications,
+    traits::registry::HKU,
+};
 
 use crate::{hive::read_base_block, tst::*};
 
@@ -36,7 +39,7 @@ fn should_cache_reg_value() {
     reader.close_key(key);
 }
 
-fn prepare_sam_reader() -> Box<dyn RegistryReader>{
+fn prepare_sam_reader() -> Box<dyn RegistryReader> {
     let mut reader = HiveRegistryReader::new();
     let mut fs = init_virtual_fs();
     let sam_file = read_sam_hive(&mut fs);
@@ -45,7 +48,7 @@ fn prepare_sam_reader() -> Box<dyn RegistryReader>{
 }
 
 #[test]
-fn should_open_keys_in_sam_hive(){
+fn should_open_keys_in_sam_hive() {
     let mut reader = prepare_sam_reader();
     open_keys_sam_hive(&mut reader);
 }
@@ -75,8 +78,7 @@ fn should_load_hives_from_fs_in_local() {
     open_keys_user_super_secret_admin(&mut reader);
 }
 
-
-fn enumerate_keys_test(reader : &mut Box<dyn RegistryReader>) {
+fn enumerate_keys_test(reader: &mut Box<dyn RegistryReader>) {
     let builtin = reader.open_key(HKLM, r"SAM\Domains\Builtin").unwrap();
     //let pepe_contento = reader.open_key(user_names, "pepe.contento.secret").unwrap();
     let names = reader.enumerate_values(builtin).unwrap();
@@ -91,7 +93,7 @@ fn enumerate_keys_test(reader : &mut Box<dyn RegistryReader>) {
     assert_eq!(26, names.len());
 }
 
-fn open_keys_sam_hive(reader : &mut Box<dyn RegistryReader>) {
+fn open_keys_sam_hive(reader: &mut Box<dyn RegistryReader>) {
     let key_pairs = [
         (r"SAM\Domains", 976),
         (r"SAM\Domains\Builtin", 1112),
@@ -127,11 +129,27 @@ fn open_keys_sam_hive(reader : &mut Box<dyn RegistryReader>) {
     assert_eq!("SuperSecretAdmin", users[5]);
 }
 
-fn open_keys_user_super_secret_admin(reader : &mut Box<dyn RegistryReader>) {
+fn open_keys_user_super_secret_admin(reader: &mut Box<dyn RegistryReader>) {
     let user_names_key = reader
         .open_key(HKU, r"S-1-5-21-3656677704-2377210397-1510584988-1004")
         .expect("Should open SuperSecretAdmin profile");
-    let admin_keys = reader.enumerate_keys(user_names_key).expect("Should enumerate all user profiles");
-    assert_eq!(vec!["AppEvents", "Console", "Control Panel", "Environment", "EUDC", "Keyboard Layout", "Network", "Printers", "SOFTWARE", "System"], admin_keys);
+    let admin_keys = reader
+        .enumerate_keys(user_names_key)
+        .expect("Should enumerate all user profiles");
+    assert_eq!(
+        vec![
+            "AppEvents",
+            "Console",
+            "Control Panel",
+            "Environment",
+            "EUDC",
+            "Keyboard Layout",
+            "Network",
+            "Printers",
+            "SOFTWARE",
+            "System"
+        ],
+        admin_keys
+    );
     // Volatile Environment is populated when logon
 }
