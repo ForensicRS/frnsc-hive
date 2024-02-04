@@ -117,6 +117,7 @@ pub fn initialize_receiver(recv: Receiver<Notification>) {
     });
     // Wait for local_key_cell_methods
 }
+#[allow(dead_code)]
 /// Initializes the Receiver to simplify testing
 pub fn initialize_logger(recv: Receiver<Message>) {
     let _ = LOGGER.with(|v| {

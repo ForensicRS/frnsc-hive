@@ -1,4 +1,4 @@
-use forensic_rs::prelude::ForensicResult;
+use forensic_rs::{err::ForensicError, prelude::ForensicResult};
 pub const INDEX_LEAF_SIGNATURE: &[u8; 2] = b"li";
 pub const FAST_LEAF_SIGNATURE: &[u8; 2] = b"lf";
 pub const HASH_LEAF_SIGNATURE: &[u8; 2] = b"lh";
@@ -324,12 +324,12 @@ pub fn read_cell(data: &[u8], offset: u64) -> ForensicResult<HiveCell> {
 pub fn read_index_leaf_cell(data: &[u8], offset: u64) -> ForensicResult<IndexLeafCell> {
     let signature = &data[0..2];
     if signature != INDEX_LEAF_SIGNATURE {
-        return Err(forensic_rs::prelude::ForensicError::BadFormat);
+        return Err(ForensicError::bad_format_str("Invalid IndexLeafCell: invalid signature"));
     }
     let n_elements = u16::from_ne_bytes(data[2..4].try_into().unwrap_or_default());
     let total_size_elements = (n_elements as usize) * 4 + 4;
     if total_size_elements > data.len() {
-        return Err(forensic_rs::prelude::ForensicError::BadFormat);
+        return Err(ForensicError::bad_format_str("Invalid IndexLeafCell: size larger than buffer"));
     }
     let mut offset_list = Vec::with_capacity(n_elements.into());
     for i in (4..(4 + 4 * n_elements as usize)).step_by(4) {
@@ -345,12 +345,12 @@ pub fn read_index_leaf_cell(data: &[u8], offset: u64) -> ForensicResult<IndexLea
 pub fn read_fast_leaf_cell(data: &[u8], offset: u64) -> ForensicResult<FastLeafCell> {
     let signature = &data[0..2];
     if signature != FAST_LEAF_SIGNATURE {
-        return Err(forensic_rs::prelude::ForensicError::BadFormat);
+        return Err(ForensicError::bad_format_str("Invalid FastLeafCell: invalid signature"));
     }
     let n_elements = u16::from_ne_bytes(data[2..4].try_into().unwrap_or_default());
     let total_size_elements = (n_elements as usize) * 8 + 4;
     if total_size_elements > data.len() {
-        return Err(forensic_rs::prelude::ForensicError::BadFormat);
+        return Err(ForensicError::bad_format_str("Invalid FastLeafCell: size larger than buffer"));
     }
     let mut offset_list = Vec::with_capacity(n_elements.into());
     for i in (4..(4 + 8 * n_elements as usize)).step_by(8) {
@@ -374,12 +374,12 @@ pub fn read_fast_leaf_cell(data: &[u8], offset: u64) -> ForensicResult<FastLeafC
 pub fn read_hash_leaf_cell(data: &[u8], offset: u64) -> ForensicResult<HashLeafCell> {
     let signature = &data[0..2];
     if signature != HASH_LEAF_SIGNATURE {
-        return Err(forensic_rs::prelude::ForensicError::BadFormat);
+        return Err(ForensicError::bad_format_str("Invalid HashLeafCell: invalid signature"));
     }
     let n_elements = u16::from_ne_bytes(data[2..4].try_into().unwrap_or_default());
     let total_size_elements = (n_elements as usize) * 8 + 4;
     if total_size_elements > data.len() {
-        return Err(forensic_rs::prelude::ForensicError::BadFormat);
+        return Err(ForensicError::bad_format_str("Invalid HashLeafCell: size larger than buffer"));
     }
     let mut offset_list = Vec::with_capacity(n_elements.into());
     for i in (4..total_size_elements).step_by(8) {
@@ -396,12 +396,12 @@ pub fn read_hash_leaf_cell(data: &[u8], offset: u64) -> ForensicResult<HashLeafC
 pub fn read_index_root_cell(data: &[u8], offset: u64) -> ForensicResult<IndexRootCell> {
     let signature = &data[0..2];
     if signature != INDEX_ROOT_SIGNATURE {
-        return Err(forensic_rs::prelude::ForensicError::BadFormat);
+        return Err(ForensicError::bad_format_str("Invalid IndexRootCell: invalid signature"));
     }
     let n_elements = u16::from_ne_bytes(data[2..4].try_into().unwrap_or_default());
     let total_size_elements = (n_elements as usize) * 8 + 4;
     if total_size_elements > data.len() {
-        return Err(forensic_rs::prelude::ForensicError::BadFormat);
+        return Err(ForensicError::bad_format_str("Invalid IndexRootCell: size larger than buffer"));
     }
     let mut offset_list = Vec::with_capacity(n_elements.into());
     for i in (4..(4 + 4 * n_elements as usize)).step_by(4) {
@@ -419,17 +419,17 @@ pub fn read_index_root_cell(data: &[u8], offset: u64) -> ForensicResult<IndexRoo
 pub fn read_key_node_cell(data: &[u8], offset: u64) -> ForensicResult<KeyNodeCell> {
     let signature = &data[0..2];
     if signature != KEY_NODE_SIGNATURE {
-        return Err(forensic_rs::prelude::ForensicError::BadFormat);
+        return Err(ForensicError::bad_format_str("Invalid KeyNode: invalid signature"));
     }
     let (head, body, tail) = unsafe { data[0..76].align_to::<KeyNodeCellPacked>() };
     if !head.is_empty() && !tail.is_empty() {
-        return Err(forensic_rs::prelude::ForensicError::BadFormat);
+        return Err(ForensicError::bad_format_str("Invalid KeyNode: structure not aligned"));
     }
     let packed_cell = &body[0];
     let mut cell: KeyNodeCell = packed_cell.into();
     cell.offset = offset;
     if 76 + cell.key_name_length as usize > data.len() {
-        return Err(forensic_rs::prelude::ForensicError::BadFormat);
+        return Err(ForensicError::bad_format_str("Invalid KeyNodeCell: size larger than buffer"));
     }
     cell.key_name = if cell.flags & KEY_COMP_NAME_FLAG == 0 {
         let mut arr = Vec::with_capacity(cell.key_name_length as usize);
@@ -446,18 +446,18 @@ pub fn read_key_node_cell(data: &[u8], offset: u64) -> ForensicResult<KeyNodeCel
 pub fn read_key_security_cell(data: &[u8], offset: u64) -> ForensicResult<KeySecurityCell> {
     let signature = &data[0..2];
     if signature != KEY_SECURITY_SIGNATURE {
-        return Err(forensic_rs::prelude::ForensicError::BadFormat);
+        return Err(ForensicError::bad_format_str("Invalid KeySecurityCell: invalid signature"));
     }
     let (head, body, tail) = unsafe { data[0..76].align_to::<KeySecurityCellPacked>() };
     if !head.is_empty() || !tail.is_empty() {
-        return Err(forensic_rs::prelude::ForensicError::BadFormat);
+        return Err(ForensicError::bad_format_str("Invalid KeySecurityCell: structure not aligned"));
     }
     let packed_cell = &body[0];
     let mut cell: KeySecurityCell = packed_cell.into();
     cell.offset = offset;
     let sec_end_pos = 20 + cell.sec_desc_size as usize;
     if sec_end_pos > data.len() {
-        return Err(forensic_rs::prelude::ForensicError::BadFormat);
+        return Err(ForensicError::bad_format_str("Invalid KeySecurityCell: size larger than buffer"));
     }
     for i in 20..sec_end_pos {
         cell.sec_desc.push(data[i]);
@@ -468,18 +468,18 @@ pub fn read_key_security_cell(data: &[u8], offset: u64) -> ForensicResult<KeySec
 pub fn read_key_value_cell(data: &[u8], offset: u64) -> ForensicResult<KeyValueCell> {
     let signature = &data[0..2];
     if signature != KEY_VALUE_SIGNATURE {
-        return Err(forensic_rs::prelude::ForensicError::BadFormat);
+        return Err(ForensicError::bad_format_str("Invalid KeyValueCell: invalid signature"));
     }
     let (head, body, tail) = unsafe { data[0..20].align_to::<KeyValueCellPacked>() };
     if !head.is_empty() || !tail.is_empty() {
-        return Err(forensic_rs::prelude::ForensicError::BadFormat);
+        return Err(ForensicError::bad_format_str("Invalid KeyValueCell: structure not aligned"));
     }
     let packed_cell = &body[0];
     let mut cell: KeyValueCell = packed_cell.into();
     cell.offset = offset;
     let value_name_end = 20 + cell.name_length as usize;
     if value_name_end > data.len() {
-        return Err(forensic_rs::prelude::ForensicError::BadFormat);
+        return Err(ForensicError::bad_format_str("Invalid KeyValueCell: size larger than buffer"));
     }
     if cell.name_length != 0 {
         cell.value_name = if cell.flags & VALUE_COMP_NAME_FLAG == 0 {

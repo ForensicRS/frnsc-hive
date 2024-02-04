@@ -1,7 +1,5 @@
 use std::{
-    cell::RefCell,
-    collections::BTreeMap,
-    path::{Path, PathBuf},
+    cell::RefCell, collections::BTreeMap, path::{Path, PathBuf}
 };
 
 use forensic_rs::{
@@ -33,13 +31,28 @@ const DATA_TYPE_REG_EXPAND_SZ: u32 = 0x2;
 const DATA_TYPE_REG_BINARY: u32 = 0x03;
 const DATA_TYPE_REG_DWORD: u32 = 0x04;
 const DATA_TYPE_REG_DWORD_BE: u32 = 0x05;
+#[allow(dead_code)]
 const DATA_TYPE_REG_LINK: u32 = 0x06;
+#[allow(dead_code)]
 const DATA_TYPE_REG_MULTI_SZ: u32 = 0x07;
+#[allow(dead_code)]
 const DATA_TYPE_REG_RESOURCE_LIST: u32 = 0x08;
+#[allow(dead_code)]
 const DATA_TYPE_REG_FULL_RESOURCE_DESCRIPTOR: u32 = 0x09;
+#[allow(dead_code)]
 const DATA_TYPE_REG_RESOURCE_REQUIREMENTS_LIST: u32 = 0x0a;
 const DATA_TYPE_REG_QWORD: u32 = 0xb;
 
+/// Implements RegistryReader from Hive files.
+/// 
+/// ```
+/// use forensic_rs::core::fs::{ChRootFileSystem, StdVirtualFS};
+/// use frnsc_hive::reader::HiveRegistryReader;
+/// // Initialize a ChRoot FS to make the folder ./artifacts/ the root folder
+/// let fs = Box::new(ChRootFileSystem::new("./artifacts/", Box::new(StdVirtualFS::new())));
+/// // The hive registry reader searchs for hives in C:\Windows\System32\Config that its translated into ./artifacts/C/Windows/System32/Config
+/// let mut reader = HiveRegistryReader::from_fs(fs).unwrap();
+/// ```
 pub struct HiveRegistryReader {
     /// HKEY_CURRENT_CONFIG: System, System.alt, System.log, System.sav
     current_config: Option<RefCell<HiveFiles>>,
@@ -59,10 +72,6 @@ pub struct HiveRegistryReader {
     /// Associate a hkey with a path for the mounted registry keys
     cached_keys: RefCell<BTreeMap<isize, String>>,
     key_counter: RefCell<usize>,
-}
-
-fn missing_key() -> ForensicError {
-    ForensicError::Missing
 }
 
 pub struct HiveReader {
@@ -335,10 +344,10 @@ impl HiveFiles {
         }
         let key_node_cell = cell_cache
             .get(base_block.root_cell_offset as u64)
-            .ok_or_else(missing_key)?;
+            .ok_or_else(|| ForensicError::missing_str("Missing root cell"))?;
         let root_cell = match key_node_cell {
             HiveCell::KeyNode(v) => v.clone(),
-            _ => return Err(missing_key()),
+            _ => return Err(ForensicError::missing_str("Expected RootCell of type KeyNode")),
         };
         Ok(Self {
             location,
@@ -387,7 +396,7 @@ impl HiveFiles {
         let mut path_separator = key_name.split(|v| v == '/' || v == '\\');
         let root_cell = match self.get_cell_at_offset(offset)? {
             HiveCell::KeyNode(kn) => kn,
-            _ => return Err(ForensicError::Missing),
+            _ => return Err(ForensicError::missing_str("Missing root cell")),
         };
         let subkeys_offset = root_cell.subkeys_list_offset;
         let n_subkeys = root_cell.number_subkeys;
@@ -397,7 +406,7 @@ impl HiveFiles {
             None => return Ok(32), // Root Cell
         };
         if n_subkeys == 0 {
-            return Err(ForensicError::Missing);
+            return Err(ForensicError::missing_str("Key not found"));
         }
         let mut next_offset = subkeys_offset;
         let mut actual_path = first;
@@ -411,11 +420,11 @@ impl HiveFiles {
                             continue 'out;
                         }
                     }
-                    return Err(missing_key());
+                    return Err(ForensicError::missing_str("HashLeaf not found"));
                 }
                 HiveCell::KeyNode(kn) => {
                     if kn.key_name != actual_path {
-                        return Err(missing_key());
+                        return Err(ForensicError::missing_str("Key node path does not match key path"));
                     }
                     match path_separator.next() {
                         Some(v) => {
@@ -450,7 +459,7 @@ impl HiveFiles {
             return Ok(32);
         }
         if n_subkeys == 0 {
-            return Err(ForensicError::Missing);
+            return Err(ForensicError::missing_str("Key not found"));
         }
         let mut next_offset = subkeys_offset;
         let mut actual_path = first;
@@ -464,11 +473,11 @@ impl HiveFiles {
                             continue 'out;
                         }
                     }
-                    return Err(missing_key());
+                    return Err(ForensicError::missing_str("HashLeaf not found"));
                 }
                 HiveCell::KeyNode(kn) => {
                     if kn.key_name != actual_path {
-                        return Err(missing_key());
+                        return Err(ForensicError::missing_str("Key node path does not match key path"));
                     }
                     match path_separator.next() {
                         Some(v) => {
@@ -485,14 +494,14 @@ impl HiveFiles {
     }
 
     pub fn get_root_cell(&self) -> ForensicResult<&KeyNodeCell> {
-        let cell = self.cell_cache.get(32).ok_or_else(missing_key)?;
+        let cell = self.cell_cache.get(32).ok_or_else(|| ForensicError::missing_str("Root cell not found"))?;
 
         let kn = match cell {
             HiveCell::KeyNode(ir) => ir,
-            _ => return Err(missing_key()),
+            _ => return Err(ForensicError::bad_format_str("Invalid RootCell type")),
         };
         if kn.key_name != "ROOT" {
-            return Err(ForensicError::Other("Cannot find ROOT cell".into()));
+            return Err(ForensicError::bad_format_str("RootCell not found"));
         }
         Ok(kn)
     }
@@ -508,7 +517,7 @@ impl HiveFiles {
         self.cell_cache.insert(cell);
         match self.cell_cache.get(offset) {
             Some(cell) => Ok(cell),
-            None => Err(ForensicError::Missing),
+            None => Err(ForensicError::missing_str("Hive cell not found")),
         }
     }
     pub fn get_cell_or_native_at_offset(&mut self, offset: u64) -> ForensicResult<&HiveCell> {
@@ -523,7 +532,7 @@ impl HiveFiles {
         self.cell_cache.insert(cell);
         match self.cell_cache.get(offset) {
             Some(cell) => Ok(cell),
-            None => Err(ForensicError::Missing),
+            None => Err(ForensicError::missing_str("Hive cell not found")),
         }
     }
 
@@ -534,7 +543,7 @@ impl HiveFiles {
 
 impl RegistryReader for HiveRegistryReader {
     fn from_file(&self, _file: Box<dyn VirtualFile>) -> ForensicResult<Box<dyn RegistryReader>> {
-        Err(ForensicError::BadFormat)
+        Err(ForensicError::bad_format_str("Cannot create HiveRegistryReader from file"))
     }
 
     fn from_fs(
@@ -547,24 +556,26 @@ impl RegistryReader for HiveRegistryReader {
     fn open_key(&self, hkey: RegHiveKey, mut key_name: &str) -> ForensicResult<RegHiveKey> {
         match hkey {
             RegHiveKey::HkeyLocalMachine => {
-                let mut path_separator = key_name.split(|v| v == '/' || v == '\\');
-                let first_key = path_separator.next().ok_or_else(missing_key)?;
+                let (first_key, _rest) = match key_name.split_once(|v| v == '/' || v == '\\') {
+                    Some(v) => v,
+                    None => (key_name, "")
+                };
                 let (hive, hive_type) = if first_key == "SAM" {
-                    (self.sam.as_ref().ok_or_else(missing_key)?, HIVE_TYPE_SAM)
+                    (self.sam.as_ref().ok_or_else(|| ForensicError::missing_str("Cannot find SAM hive"))?, HIVE_TYPE_SAM)
                 } else if first_key == "SECURITY" {
                     (
-                        self.security.as_ref().ok_or_else(missing_key)?,
+                        self.security.as_ref().ok_or_else(|| ForensicError::missing_str("Cannot find SECURITY hive"))?,
                         HIVE_TYPE_SECURITY,
                     )
                 } else if first_key == "SOFTWARE" {
                     key_name = &key_name[9..];
                     (
-                        self.software.as_ref().ok_or_else(missing_key)?,
+                        self.software.as_ref().ok_or_else(|| ForensicError::missing_str("Cannot find SOFTWARE hive"))?,
                         HIVE_TYPE_SOFTWARE,
                     )
                 } else if first_key == "SYSTEM" {
                     (
-                        self.system.as_ref().ok_or_else(missing_key)?,
+                        self.system.as_ref().ok_or_else(|| ForensicError::missing_str("Cannot find SYSTEM hive"))?,
                         HIVE_TYPE_SYSTEM,
                     )
                 } else {
@@ -586,7 +597,7 @@ impl RegistryReader for HiveRegistryReader {
                             HIVE_TYPE_CACHED,
                         )));
                     }
-                    return Err(missing_key());
+                    return Err(ForensicError::missing_str("Cannot find HKLM mounted hive"));
                 };
                 let mut hive = match hive.try_borrow_mut() {
                     Ok(v) => v,
@@ -612,8 +623,8 @@ impl RegistryReader for HiveRegistryReader {
                     .users
                     .iter()
                     .position(|v| v.0 == username)
-                    .ok_or_else(missing_key)?;
-                let (_user_id, user_hive) = self.users.get(position).ok_or_else(missing_key)?;
+                    .ok_or_else(|| ForensicError::missing_str("Cannot find HKU hive"))?;
+                let (_user_id, user_hive) = self.users.get(position).ok_or_else(|| ForensicError::missing_str("Invalid HKU hive"))?;
                 let mut hive = match user_hive.try_borrow_mut() {
                     Ok(v) => v,
                     Err(e) => {
@@ -623,37 +634,36 @@ impl RegistryReader for HiveRegistryReader {
                         )))
                     }
                 };
-                trace!("Opening user key");
                 let hive_key = hive.open_key(rest_of_path)?;
                 Ok(user_hive_by_position(position as u16, hive_key))
             }
             RegHiveKey::Hkey(hkey) => {
                 let (hive, offset, hive_type) = match select_hive_by_hkey(RegHiveKey::Hkey(hkey)) {
-                    SelectedHive::None => return Err(missing_key()),
+                    SelectedHive::None => return Err(ForensicError::missing_str("Invalid hive")),
                     SelectedHive::Sam(offset) => (
-                        self.sam.as_ref().ok_or_else(missing_key)?,
+                        self.sam.as_ref().ok_or_else(|| ForensicError::missing_str("Invalid SAM hive"))?,
                         offset,
                         HIVE_TYPE_SAM,
                     ),
                     SelectedHive::Security(offset) => (
-                        self.security.as_ref().ok_or_else(missing_key)?,
+                        self.security.as_ref().ok_or_else(|| ForensicError::missing_str("Invalid SECURITY hive"))?,
                         offset,
                         HIVE_TYPE_SECURITY,
                     ),
                     SelectedHive::Software(offset) => (
-                        self.software.as_ref().ok_or_else(missing_key)?,
+                        self.software.as_ref().ok_or_else(|| ForensicError::missing_str("Invalid SOFTWARE hive"))?,
                         offset,
                         HIVE_TYPE_SOFTWARE,
                     ),
                     SelectedHive::System(offset) => (
-                        self.system.as_ref().ok_or_else(missing_key)?,
+                        self.system.as_ref().ok_or_else(|| ForensicError::missing_str("Invalid SYSTEM hive"))?,
                         offset,
                         HIVE_TYPE_SYSTEM,
                     ),
                     SelectedHive::Mounted(_) => todo!(),
                     SelectedHive::User((position, offset)) => {
                         let (_user_id, hive) =
-                            self.users.get(position as usize).ok_or_else(missing_key)?;
+                            self.users.get(position as usize).ok_or_else(|| ForensicError::missing_str("Invalid User hive"))?;
                         (hive, offset, HIVE_TYPE_USER)
                     }
                 };
@@ -671,46 +681,45 @@ impl RegistryReader for HiveRegistryReader {
                     hive_key, hive_type,
                 )))
             }
-            _ => Err(forensic_rs::prelude::ForensicError::Missing),
+            _ => Err(ForensicError::missing_str("Hive not found")),
         }
     }
 
     fn read_value(&self, hkey: RegHiveKey, value_name: &str) -> ForensicResult<RegValue> {
         let (hive, offset, _hive_type) = match select_hive_by_hkey(hkey) {
-            SelectedHive::None => return Err(missing_key()),
+            SelectedHive::None => return Err(ForensicError::missing_str("Invalid hive")),
             SelectedHive::Sam(offset) => (
-                self.sam.as_ref().ok_or_else(missing_key)?,
+                self.sam.as_ref().ok_or_else(|| ForensicError::missing_str("Invalid SAM hive"))?,
                 offset,
                 HIVE_TYPE_SAM,
             ),
             SelectedHive::Security(offset) => (
-                self.security.as_ref().ok_or_else(missing_key)?,
+                self.security.as_ref().ok_or_else(|| ForensicError::missing_str("Invalid Security hive"))?,
                 offset,
                 HIVE_TYPE_SECURITY,
             ),
             SelectedHive::Software(offset) => (
-                self.software.as_ref().ok_or_else(missing_key)?,
+                self.software.as_ref().ok_or_else(|| ForensicError::missing_str("Invalid SOFTWARE hive"))?,
                 offset,
                 HIVE_TYPE_SOFTWARE,
             ),
             SelectedHive::System(offset) => (
-                self.system.as_ref().ok_or_else(missing_key)?,
+                self.system.as_ref().ok_or_else(|| ForensicError::missing_str("Invalid SYSTEM hive"))?,
                 offset,
                 HIVE_TYPE_SYSTEM,
             ),
             SelectedHive::Mounted(key_id) => {
                 let cached_keys = self.cached_keys.borrow();
                 let key_id = key_id as isize;
-                println!("{:?}", cached_keys);
-                let cached = cached_keys.get(&key_id).ok_or_else(missing_key)?;
+                let cached = cached_keys.get(&key_id).ok_or_else(|| ForensicError::missing_str("Invalid mounted hive hive"))?;
                 let mounted = self.mounted.borrow();
                 let path_map = mounted
                     .get_value(cached, value_name)
-                    .ok_or_else(missing_key)?;
+                    .ok_or_else(|| ForensicError::missing_str("Invalid handle"))?;
                 return Ok(path_map);
             }
             SelectedHive::User((position, offset)) => {
-                let (_user_id, hive) = self.users.get(position as usize).ok_or_else(missing_key)?;
+                let (_user_id, hive) = self.users.get(position as usize).ok_or_else(|| ForensicError::missing_str("Invalid User hive"))?;
                 (hive, offset, HIVE_TYPE_USER)
             }
         };
@@ -752,7 +761,7 @@ impl RegistryReader for HiveRegistryReader {
         }
         let (data_offset, _data_size, data_type, flags) = match data {
             Some(v) => v,
-            None => return Err(ForensicError::BadFormat),
+            None => return Err(ForensicError::missing_str("Invalid data cell type")),
         };
         let data_cell = borrow_hive.get_cell_or_native_at_offset(data_offset as u64)?;
 
@@ -804,34 +813,34 @@ impl RegistryReader for HiveRegistryReader {
 
     fn enumerate_values(&self, hkey: RegHiveKey) -> ForensicResult<Vec<String>> {
         let (mut borrow_hive, offset) = match select_hive_by_hkey(hkey) {
-            SelectedHive::None => return Err(missing_key()),
+            SelectedHive::None => return Err(ForensicError::missing_str("Invalid hive")),
             SelectedHive::Sam(offset) => (
-                self.sam.as_ref().ok_or_else(missing_key)?.borrow_mut(),
+                self.sam.as_ref().ok_or_else(|| ForensicError::missing_str("Invalid SAM hive"))?.borrow_mut(),
                 offset,
             ),
             SelectedHive::Security(offset) => (
-                self.security.as_ref().ok_or_else(missing_key)?.borrow_mut(),
+                self.security.as_ref().ok_or_else(|| ForensicError::missing_str("Invalid SECURITY hive"))?.borrow_mut(),
                 offset,
             ),
             SelectedHive::Software(offset) => (
-                self.software.as_ref().ok_or_else(missing_key)?.borrow_mut(),
+                self.software.as_ref().ok_or_else(|| ForensicError::missing_str("Invalid SOFTWARE hive"))?.borrow_mut(),
                 offset,
             ),
             SelectedHive::System(offset) => (
-                self.system.as_ref().ok_or_else(missing_key)?.borrow_mut(),
+                self.system.as_ref().ok_or_else(|| ForensicError::missing_str("Invalid SYSTEM hive"))?.borrow_mut(),
                 offset,
             ),
             SelectedHive::Mounted(key_id) => {
                 let a = self.cached_keys.borrow_mut();
                 let _b = match a.get(&(key_id as isize)) {
                     Some(v) => v,
-                    None => return Err(missing_key()),
+                    None => return Err(ForensicError::missing_str("Invalid mounted hive hive")),
                 };
                 //let value = self.mounted.borrow().get(b);
                 todo!();
             }
             SelectedHive::User((usr, offset)) => {
-                let (_user_id, hive) = self.users.get(usr as usize).ok_or_else(missing_key)?;
+                let (_user_id, hive) = self.users.get(usr as usize).ok_or_else(|| ForensicError::missing_str("Invalid User hive"))?;
                 (hive.borrow_mut(), offset)
             }
         };
@@ -842,7 +851,7 @@ impl RegistryReader for HiveRegistryReader {
         let cell = borrow_hive.get_cell_at_offset(offset)?;
         let key_node = match cell {
             HiveCell::KeyNode(v) => v,
-            _ => return Err(missing_key()),
+            _ => return Err(ForensicError::bad_format_string(format!("Invalid Cell type at offset={}. Expected KeyNode", offset))),
         };
         let number_key_values = key_node.number_key_values;
         let key_values_list_offset = key_node.key_values_list_offset;
@@ -875,26 +884,26 @@ impl RegistryReader for HiveRegistryReader {
 
     fn enumerate_keys(&self, hkey: RegHiveKey) -> ForensicResult<Vec<String>> {
         let (mut borrow_hive, offset) = match select_hive_by_hkey(hkey) {
-            SelectedHive::None => return Err(missing_key()),
+            SelectedHive::None => return Err(ForensicError::missing_str("Invalid hive")),
             SelectedHive::Sam(offset) => (
-                self.sam.as_ref().ok_or_else(missing_key)?.borrow_mut(),
+                self.sam.as_ref().ok_or_else(|| ForensicError::missing_str("Invalid SAM hive"))?.borrow_mut(),
                 offset,
             ),
             SelectedHive::Security(offset) => (
-                self.security.as_ref().ok_or_else(missing_key)?.borrow_mut(),
+                self.security.as_ref().ok_or_else(|| ForensicError::missing_str("Invalid SECURITY hive"))?.borrow_mut(),
                 offset,
             ),
             SelectedHive::Software(offset) => (
-                self.software.as_ref().ok_or_else(missing_key)?.borrow_mut(),
+                self.software.as_ref().ok_or_else(|| ForensicError::missing_str("Invalid SOFTWARE hive"))?.borrow_mut(),
                 offset,
             ),
             SelectedHive::System(offset) => (
-                self.system.as_ref().ok_or_else(missing_key)?.borrow_mut(),
+                self.system.as_ref().ok_or_else(|| ForensicError::missing_str("Invalid SYSTEM hive"))?.borrow_mut(),
                 offset,
             ),
             SelectedHive::Mounted(_) => todo!(),
             SelectedHive::User((usr, offset)) => {
-                let (_user_id, hive) = self.users.get(usr as usize).ok_or_else(missing_key)?;
+                let (_user_id, hive) = self.users.get(usr as usize).ok_or_else(|| ForensicError::missing_str("Invalid User hive"))?;
                 (hive.borrow_mut(), offset)
             }
         };
@@ -905,13 +914,13 @@ impl RegistryReader for HiveRegistryReader {
         let cell = borrow_hive.get_cell_at_offset(offset)?;
         let key_node = match cell {
             HiveCell::KeyNode(v) => v,
-            _ => return Err(missing_key()),
+            _ => return Err(ForensicError::bad_format_string(format!("Invalid Cell type at offset={}. Expected KeyNode", offset))),
         };
         let subkeys_list_offset = key_node.subkeys_list_offset;
         let mut subkeys = Vec::with_capacity(key_node.number_subkeys as usize);
         let subkey_list_cell = match borrow_hive.get_cell_at_offset(subkeys_list_offset as u64)? {
             HiveCell::HashLeaf(v) => v,
-            _ => return Err(missing_key()),
+            _ => return Err(ForensicError::bad_format_string(format!("Invalid Cell type at offset={}. Expected HashLeaf", offset))),
         };
         let offsets: Vec<u32> = subkey_list_cell.elements.iter().map(|v| v.offset).collect();
         for offset in offsets {
@@ -929,7 +938,7 @@ impl RegistryReader for HiveRegistryReader {
             };
             let knc = match cell {
                 HiveCell::KeyNode(v) => v,
-                _ => return Err(ForensicError::BadFormat),
+                _ => return Err(ForensicError::bad_format_string(format!("Invalid Cell type at offset={}. Expected KeyNode", offset))),
             };
             subkeys.push(knc.key_name.clone());
         }
@@ -938,15 +947,15 @@ impl RegistryReader for HiveRegistryReader {
 
     fn key_at(&self, hkey: RegHiveKey, pos: u32) -> ForensicResult<String> {
         let (hive, offset) = match select_hive_by_hkey(hkey) {
-            SelectedHive::None => return Err(missing_key()),
-            SelectedHive::Sam(offset) => (self.sam.as_ref().ok_or_else(missing_key)?, offset),
+            SelectedHive::None => return Err(ForensicError::missing_str("Invalid hive")),
+            SelectedHive::Sam(offset) => (self.sam.as_ref().ok_or_else(|| ForensicError::missing_str("Invalid SAM hive"))?, offset),
             SelectedHive::Security(offset) => {
-                (self.security.as_ref().ok_or_else(missing_key)?, offset)
+                (self.security.as_ref().ok_or_else(|| ForensicError::missing_str("Invalid SECURITY hive"))?, offset)
             }
             SelectedHive::Software(offset) => {
-                (self.software.as_ref().ok_or_else(missing_key)?, offset)
+                (self.software.as_ref().ok_or_else(|| ForensicError::missing_str("Invalid SOFTWARE hive"))?, offset)
             }
-            SelectedHive::System(offset) => (self.system.as_ref().ok_or_else(missing_key)?, offset),
+            SelectedHive::System(offset) => (self.system.as_ref().ok_or_else(|| ForensicError::missing_str("Invalid SYSTEM hive"))?, offset),
             SelectedHive::Mounted(_offset) => {
                 todo!()
             }
@@ -960,7 +969,7 @@ impl RegistryReader for HiveRegistryReader {
         let cell = borrow_hive.get_cell_at_offset(offset)?;
         let key_node = match cell {
             HiveCell::KeyNode(v) => v,
-            _ => return Err(missing_key()),
+            _ => return Err(ForensicError::bad_format_string(format!("Invalid Cell type at offset={}. Expected KeyNode", offset))),
         };
         let subkeys_list_offset = key_node.subkeys_list_offset;
         let number_subkeys = key_node.number_subkeys;
@@ -969,7 +978,7 @@ impl RegistryReader for HiveRegistryReader {
         }
         let subkey_list_cell = match borrow_hive.get_cell_at_offset(subkeys_list_offset as u64)? {
             HiveCell::HashLeaf(v) => v,
-            _ => return Err(missing_key()),
+            _ => return Err(ForensicError::bad_format_string(format!("Invalid Cell type at offset={}. Expected HashLeaf", subkeys_list_offset))),
         };
         let offset = subkey_list_cell.elements[pos as usize].offset;
         let cell = match borrow_hive.get_cell_at_offset(offset.into()) {
@@ -981,38 +990,38 @@ impl RegistryReader for HiveRegistryReader {
                     offset,
                     err
                 );
-                return Err(ForensicError::BadFormat);
+                return Err(err);
             }
         };
         let knc = match cell {
             HiveCell::KeyNode(v) => v,
-            _ => return Err(ForensicError::BadFormat),
+            _ => return Err(ForensicError::bad_format_string(format!("Invalid Cell type at offset={}. Expected KeyNode", offset))),
         };
         Ok(knc.key_name.clone())
     }
 
     fn value_at(&self, hkey: RegHiveKey, pos: u32) -> ForensicResult<String> {
         let (mut borrow_hive, offset) = match select_hive_by_hkey(hkey) {
-            SelectedHive::None => return Err(missing_key()),
+            SelectedHive::None => return Err(ForensicError::missing_str("Invalid hive")),
             SelectedHive::Sam(offset) => (
-                self.sam.as_ref().ok_or_else(missing_key)?.borrow_mut(),
+                self.sam.as_ref().ok_or_else(|| ForensicError::missing_str("Invalid SAM hive"))?.borrow_mut(),
                 offset,
             ),
             SelectedHive::Security(offset) => (
-                self.security.as_ref().ok_or_else(missing_key)?.borrow_mut(),
+                self.security.as_ref().ok_or_else(|| ForensicError::missing_str("Invalid SECURITY hive"))?.borrow_mut(),
                 offset,
             ),
             SelectedHive::Software(offset) => (
-                self.software.as_ref().ok_or_else(missing_key)?.borrow_mut(),
+                self.software.as_ref().ok_or_else(|| ForensicError::missing_str("Invalid SOFTWARE hive"))?.borrow_mut(),
                 offset,
             ),
             SelectedHive::System(offset) => (
-                self.system.as_ref().ok_or_else(missing_key)?.borrow_mut(),
+                self.system.as_ref().ok_or_else(|| ForensicError::missing_str("Invalid SYSTEM hive"))?.borrow_mut(),
                 offset,
             ),
             SelectedHive::Mounted(_) => todo!(),
             SelectedHive::User((usr, offset)) => {
-                let (_user_id, hive) = self.users.get(usr as usize).ok_or_else(missing_key)?;
+                let (_user_id, hive) = self.users.get(usr as usize).ok_or_else(|| ForensicError::missing_str("Invalid User hive"))?;
                 (hive.borrow_mut(), offset)
             }
         };
@@ -1023,7 +1032,7 @@ impl RegistryReader for HiveRegistryReader {
         let cell = borrow_hive.get_cell_at_offset(offset)?;
         let key_node = match cell {
             HiveCell::KeyNode(v) => v,
-            _ => return Err(ForensicError::BadFormat),
+            _ => return Err(ForensicError::bad_format_string(format!("Invalid Cell type at offset={}. Expected HashLeaf", offset))),
         };
         let number_key_values = key_node.number_key_values;
         let key_values_list_offset = key_node.key_values_list_offset;
@@ -1037,12 +1046,12 @@ impl RegistryReader for HiveRegistryReader {
             HiveCell::Invalid(ic) => {
                 u32::from_ne_bytes(ic.content[pos * 4..(pos + 1) * 4].try_into().unwrap())
             }
-            _ => return Err(ForensicError::BadFormat),
+            _ => return Err(ForensicError::bad_format_str("Invalid cell type")),
         };
         let value_cell = borrow_hive.get_cell_or_native_at_offset(value_offset as u64)?;
         match value_cell {
             HiveCell::KeyValue(kv) => Ok(kv.value_name.clone()),
-            _ => Err(missing_key()),
+            _ => return Err(ForensicError::bad_format_string(format!("Invalid Cell type at offset={}. Expected KeyValue", value_offset))),
         }
     }
     fn close_key(&self, hkey: RegHiveKey) {

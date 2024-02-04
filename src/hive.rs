@@ -1,5 +1,5 @@
 use forensic_rs::{
-    notifications::NotificationType, notify_info, prelude::ForensicResult, traits::vfs::VirtualFile,
+    err::ForensicError, notifications::NotificationType, notify_info, prelude::ForensicResult, traits::vfs::VirtualFile
 };
 
 use crate::cell::{read_cell, HiveCell};
@@ -289,7 +289,7 @@ pub fn read_base_block(file: &mut Box<dyn VirtualFile>) -> ForensicResult<BaseBl
     let mut buffer = vec![0u8; 4096];
     file.read_exact(&mut buffer)?;
     if !is_valid_base_block(&buffer) {
-        return Err(forensic_rs::prelude::ForensicError::BadFormat);
+        return Err(ForensicError::bad_format_str("Invalid base block"));
     }
     if !checksum_is_correct(&buffer) {
         notify_info!(
@@ -300,14 +300,14 @@ pub fn read_base_block(file: &mut Box<dyn VirtualFile>) -> ForensicResult<BaseBl
     if is_win10_format(&buffer) {
         let (head, body, tail) = unsafe { buffer.align_to::<BaseBlockW10>() };
         if !head.is_empty() || !tail.is_empty() {
-            return Err(forensic_rs::prelude::ForensicError::BadFormat);
+            return Err(ForensicError::bad_format_str("Invalid base block for Windows 10 format"));
         }
         let base_block = &body[0];
         return Ok(base_block.into());
     }
     let (head, body, tail) = unsafe { buffer.align_to::<BaseBlockWXP>() };
     if !head.is_empty() || !tail.is_empty() {
-        return Err(forensic_rs::prelude::ForensicError::BadFormat);
+        return Err(ForensicError::bad_format_str("Invalid base block for windows XP format"));
     }
     let base_block = &body[0];
     Ok(base_block.into())
@@ -316,11 +316,11 @@ pub fn read_bin_header(file: &mut Box<dyn VirtualFile>) -> ForensicResult<HiveBi
     let mut buffer = vec![0u8; 32];
     file.read_exact(&mut buffer)?;
     if !is_hive_data(&buffer) {
-        return Err(forensic_rs::prelude::ForensicError::BadFormat);
+        return Err(ForensicError::bad_format_str("Invalid HiveBin header: signature does not match"));
     }
     let (head, body, tail) = unsafe { buffer.align_to::<HiveBinHeader>() };
     if !head.is_empty() || !tail.is_empty() {
-        return Err(forensic_rs::prelude::ForensicError::BadFormat);
+        return Err(ForensicError::bad_format_str("Invalid HiveBin header: not a header"));
     }
     let header = &body[0];
     Ok(HiveBinHeader {
@@ -346,7 +346,7 @@ pub fn read_hive_bin_at_file_position(
     };
     if header.size < 32 {
         file.seek(std::io::SeekFrom::Start(initial_offset))?;
-        return Err(forensic_rs::prelude::ForensicError::BadFormat);
+        return Err(ForensicError::bad_format_str("Invalid HiveBin header: too small"));
     }
     let mut buff = vec![0u8; header.size as usize - 32];
     file.read_exact(&mut buff)?;
@@ -356,13 +356,13 @@ pub fn read_hive_bin_at_file_position(
 pub fn read_cells(data: &[u8], bin_offset: u64) -> ForensicResult<Vec<HiveCell>> {
     let len = data.len();
     if len < 4 {
-        return Err(forensic_rs::prelude::ForensicError::BadFormat);
+        return Err(ForensicError::bad_format_str("Invalid HiveCell: too small"));
     }
     let mut offset = 0;
     let mut list = Vec::with_capacity(128);
     loop {
         if offset > len {
-            return Err(forensic_rs::prelude::ForensicError::BadFormat);
+            return Err(ForensicError::bad_format_str("Invalid HiveCell: offset at position larger than the buffer"));
         } else if offset == len {
             break;
         }
@@ -371,7 +371,7 @@ pub fn read_cells(data: &[u8], bin_offset: u64) -> ForensicResult<Vec<HiveCell>>
             i32::from_ne_bytes(data[offset..offset + 4].try_into().unwrap_or_default());
         let cell_len = cell_len_i.unsigned_abs() as usize;
         if offset + cell_len > len {
-            return Err(forensic_rs::prelude::ForensicError::BadFormat);
+            return Err(ForensicError::bad_format_str("Invalid HiveCell: end position larger than the buffer"));
         }
         let cell_data = &data[offset..offset + cell_len];
         let cell = match read_cell(cell_data, bin_offset + offset as u64) {
