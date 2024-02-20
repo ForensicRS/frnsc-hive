@@ -10,7 +10,7 @@ use forensic_rs::{
     notify_informational, notify_low,
     prelude::{ForensicError, ForensicResult, RegHiveKey, RegValue, RegistryReader, HKLM},
     trace,
-    traits::vfs::{VirtualFile, VirtualFileSystem},
+    traits::{registry::RegistryKeyInfo, vfs::{VirtualFile, VirtualFileSystem}}, utils::time::Filetime,
 };
 
 use crate::{
@@ -968,8 +968,28 @@ impl RegistryReader for HiveRegistryReader {
         };
         let cached_size = data_size as i32;
         if cached_size < 0 {
+            let size = (i32::MIN - cached_size).abs() as usize;
             let value = data_offset;
+            let data = value.to_le_bytes();
+            let data = &data[0..size.min(data.len())];
             return Ok(match data_type {
+                DATA_TYPE_REG_BINARY => RegValue::Binary(data.to_vec()),
+                DATA_TYPE_REG_SZ => {
+                    match (data.get(data.len() - 2), data.get(data.len() - 1)) {
+                        (Some(0), Some(0)) => {
+                            if data.len() == 2 { // Empty utf16 string
+                                RegValue::SZ(String::new())
+                            }else {
+                                RegValue::SZ(String::from_utf16_lossy(&[u16::from_le_bytes([data[0], data[1]])]))
+                            }
+                            
+                        },
+                        (Some(_), Some(0)) => {
+                            RegValue::SZ(String::from_utf8_lossy(&data[..data.len() - 1]).to_string())
+                        },
+                        _ => RegValue::SZ(String::from_utf8_lossy(data).to_string())
+                    }
+                },
                 DATA_TYPE_REG_DWORD => RegValue::DWord(value),
                 DATA_TYPE_REG_DWORD_BE => RegValue::DWord(value.to_be()),
                 _ => RegValue::DWord(value)
@@ -1293,8 +1313,20 @@ impl RegistryReader for HiveRegistryReader {
             SelectedHive::Mounted(_offset) => {
                 todo!()
             }
-            SelectedHive::User(_) => todo!(),
-            SelectedHive::Other(_) => todo!(),
+            SelectedHive::User((pos, offset)) => {
+                let (_, hive) = self
+                    .users
+                    .get(pos as usize)
+                    .ok_or_else(|| ForensicError::missing_str("Invalid User hive"))?;
+                (hive, offset)
+            }
+            SelectedHive::Other((pos, offset)) => {
+                let (_, hive) = self
+                    .others
+                    .get(pos as usize)
+                    .ok_or_else(|| ForensicError::missing_str("Invalid Other hive"))?;
+                (hive, offset)
+            }
         };
         let mut borrow_hive = hive.borrow_mut();
         if offset < 0 {
@@ -1437,6 +1469,86 @@ impl RegistryReader for HiveRegistryReader {
         };
         let mut cached = self.cached_keys.borrow_mut();
         cached.remove(&hkey);
+    }
+
+    fn key_info(&self, hkey: RegHiveKey) -> ForensicResult<forensic_rs::prelude::RegistryKeyInfo> {
+        let (mut borrow_hive, offset) = match select_hive_by_hkey(hkey) {
+            SelectedHive::None => return Err(ForensicError::missing_str("Invalid hive")),
+            SelectedHive::Sam(offset) => (
+                self.sam
+                    .as_ref()
+                    .ok_or_else(|| ForensicError::missing_str("Invalid SAM hive"))?
+                    .borrow_mut(),
+                offset,
+            ),
+            SelectedHive::Security(offset) => (
+                self.security
+                    .as_ref()
+                    .ok_or_else(|| ForensicError::missing_str("Invalid SECURITY hive"))?
+                    .borrow_mut(),
+                offset,
+            ),
+            SelectedHive::Software(offset) => (
+                self.software
+                    .as_ref()
+                    .ok_or_else(|| ForensicError::missing_str("Invalid SOFTWARE hive"))?
+                    .borrow_mut(),
+                offset,
+            ),
+            SelectedHive::System(offset) => (
+                self.system
+                    .as_ref()
+                    .ok_or_else(|| ForensicError::missing_str("Invalid SYSTEM hive"))?
+                    .borrow_mut(),
+                offset,
+            ),
+            SelectedHive::Mounted(key_id) => {
+                let a = self.cached_keys.borrow_mut();
+                let _b = match a.get(&(key_id as isize)) {
+                    Some(v) => v,
+                    None => return Err(ForensicError::missing_str("Invalid mounted hive hive")),
+                };
+                //let value = self.mounted.borrow().get(b);
+                todo!();
+            }
+            SelectedHive::Other((pos, offset)) => {
+                let (_user_id, hive) = self
+                    .others
+                    .get(pos as usize)
+                    .ok_or_else(|| ForensicError::missing_str("Invalid Other hive"))?;
+                (hive.borrow_mut(), offset)
+            }
+            SelectedHive::User((usr, offset)) => {
+                let (_user_id, hive) = self
+                    .users
+                    .get(usr as usize)
+                    .ok_or_else(|| ForensicError::missing_str("Invalid User hive"))?;
+                (hive.borrow_mut(), offset)
+            }
+        };
+        if offset < 0 {
+            // TODO: data not available for mounted keys/values
+            return Ok(RegistryKeyInfo::default());
+        }
+        let offset = offset as u64;
+        let cell = borrow_hive.get_cell_at_offset(offset)?;
+        let key_node = match cell {
+            HiveCell::KeyNode(v) => v,
+            _ => {
+                return Err(ForensicError::bad_format_string(format!(
+                    "Invalid Cell type at offset={}. Expected KeyNode",
+                    offset
+                )))
+            }
+        };
+        Ok(RegistryKeyInfo {
+            last_write_time : Filetime::new(key_node.last_written_timestamp),
+            max_subkey_name_length : key_node.largest_subkey_name_length as u32,
+            max_value_length : key_node.largest_value_data_size,
+            max_value_name_length : key_node.largest_value_name_length,
+            subkeys : key_node.number_subkeys,
+            values : key_node.number_key_values
+        })
     }
 }
 
