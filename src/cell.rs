@@ -58,7 +58,7 @@ impl HiveCell {
 }
 #[derive(Debug, Clone)]
 pub struct UnallocatedCell {
-    pub offset: u64,
+    pub offset: u64
 }
 
 #[derive(Debug, Clone)]
@@ -283,6 +283,15 @@ pub struct BigDataCell {
     pub offset: u64,
 }
 
+pub fn peek_cell(data : &[u8]) -> usize {
+    if data.len() < 4 {
+        return 0
+    }
+    let cell_len_i = i32::from_ne_bytes(data[..4].try_into().unwrap_or_default());
+    let cell_len = cell_len_i.unsigned_abs() as usize;
+    cell_len
+}
+
 pub fn read_cell(data: &[u8], offset: u64) -> ForensicResult<HiveCell> {
     let cell_len_i = i32::from_ne_bytes(data[..4].try_into().unwrap_or_default());
     let cell_len = cell_len_i.unsigned_abs() as usize;
@@ -290,6 +299,9 @@ pub fn read_cell(data: &[u8], offset: u64) -> ForensicResult<HiveCell> {
         return Ok(HiveCell::Unallocated(UnallocatedCell { offset }));
     }
     let signature = &data[4..6];
+    if cell_len > data.len() {
+        return Err(ForensicError::bad_format_str("Not enough buffer size"))
+    }
     let data = &data[4..cell_len];
     let cell = if signature == INDEX_LEAF_SIGNATURE {
         let cell = read_index_leaf_cell(data, offset)?;
@@ -399,7 +411,7 @@ pub fn read_index_root_cell(data: &[u8], offset: u64) -> ForensicResult<IndexRoo
         return Err(ForensicError::bad_format_str("Invalid IndexRootCell: invalid signature"));
     }
     let n_elements = u16::from_ne_bytes(data[2..4].try_into().unwrap_or_default());
-    let total_size_elements = (n_elements as usize) * 8 + 4;
+    let total_size_elements = (n_elements as usize) * 4 + 4;
     if total_size_elements > data.len() {
         return Err(ForensicError::bad_format_str("Invalid IndexRootCell: size larger than buffer"));
     }

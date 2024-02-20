@@ -66,6 +66,7 @@ fn should_load_hives_from_fs() {
         .from_fs(init_virtual_fs())
         .unwrap();
     enumerate_keys_test(&mut reader);
+    enumerate_keys_local_machine(&mut reader);
 }
 #[test]
 #[ignore]
@@ -91,6 +92,11 @@ fn enumerate_keys_test(reader: &mut Box<dyn RegistryReader>) {
         .unwrap();
     let names = reader.enumerate_keys(aliases).unwrap();
     assert_eq!(26, names.len());
+}
+
+fn enumerate_keys_local_machine(reader: &mut Box<dyn RegistryReader>) {
+    let subkeys = reader.enumerate_keys(HKLM).expect("Should enumerate HKLM subkeys");
+    assert!(subkeys.len() > 0);
 }
 
 fn open_keys_sam_hive(reader: &mut Box<dyn RegistryReader>) {
