@@ -1348,38 +1348,59 @@ impl RegistryReader for HiveRegistryReader {
         if pos >= number_subkeys {
             return Err(ForensicError::Other("Invalid position".into()));
         }
-        let subkey_list_cell = match borrow_hive.get_cell_at_offset(subkeys_list_offset as u64)? {
-            HiveCell::HashLeaf(v) => v,
+        let mut offsets: Vec<u32> = match borrow_hive.get_cell_at_offset(subkeys_list_offset as u64)? {
+            HiveCell::HashLeaf(v) => {
+                v.elements.iter().map(|v| v.offset).collect()
+            }
+            HiveCell::FastLeaf(v) => {
+                v.elements.iter().map(|v| v.offset).collect()
+            }
+            HiveCell::IndexLeaf(v) => {
+                v.elements.iter().map(|v| v.offset).collect()
+            },
+            HiveCell::IndexRoot(v) => {
+                v.elements.iter().map(|v| v.subkeys_list_offset).collect()
+            },
             _ => {
                 return Err(ForensicError::bad_format_string(format!(
-                    "Invalid Cell type at offset={}. Expected HashLeaf",
-                    subkeys_list_offset
-                )))
-            }
-        };
-        let offset = subkey_list_cell.elements[pos as usize].offset;
-        let cell = match borrow_hive.get_cell_at_offset(offset.into()) {
-            Ok(v) => v,
-            Err(err) => {
-                notify_informational!(
-                    NotificationType::Informational,
-                    "Error loading cell at offset={}. {:?}",
-                    offset,
-                    err
-                );
-                return Err(err);
-            }
-        };
-        let knc = match cell {
-            HiveCell::KeyNode(v) => v,
-            _ => {
-                return Err(ForensicError::bad_format_string(format!(
-                    "Invalid Cell type at offset={}. Expected KeyNode",
+                    "Invalid Cell type at offset={}. Expected Leaf type",
                     offset
                 )))
             }
+            
         };
-        Ok(knc.key_name.clone())
+        let mut pos = pos as usize;
+        while pos < offsets.len() {
+            let offset = match offsets.get(pos) {
+                Some(v) => *v,
+                None => continue
+            };
+            let cell = match borrow_hive.get_cell_at_offset(offset.into()) {
+                Ok(v) => v,
+                Err(err) => {
+                    notify_informational!(
+                        NotificationType::Informational,
+                        "Error loading cell at offset={}. {:?}",
+                        offset,
+                        err
+                    );
+                    continue;
+                }
+            };
+            match cell {
+                HiveCell::KeyNode(v) => {
+                    return Ok(v.key_name.clone())
+                },
+                HiveCell::IndexLeaf(v) => {
+                    for el in &v.elements{
+                        offsets.push(el.offset);
+                    }
+                },
+                _ => continue
+            };
+            pos += 1;
+        }
+        Err(ForensicError::NoMoreData)
     }
 
     fn value_at(&self, hkey: RegHiveKey, pos: u32) -> ForensicResult<String> {
