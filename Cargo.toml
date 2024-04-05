@@ -1,6 +1,6 @@
 [package]
 name = "frnsc-hive"
-version = "0.10.0"
+version = "0.13.0"
 authors = ["Samuel Garcés Marín <samuel.garces@protonmail.com>"]
 keywords = ["forensic", "windows", "parser", "registry", "cybersecurity"]
 categories = ["parsing"]
@@ -14,5 +14,5 @@ exclude = ["/artifacts"]
 "default" = []
 
 [dependencies]
-forensic-rs = "0.10"
+forensic-rs = "0.13"
 #forensic-rs = { path = "../forensic-rs" } # Dev
