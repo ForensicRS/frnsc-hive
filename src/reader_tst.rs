@@ -47,6 +47,14 @@ fn prepare_sam_reader() -> Box<dyn RegistryReader> {
     Box::new(reader)
 }
 
+fn prepare_software_reader() -> Box<dyn RegistryReader> {
+    let mut reader = HiveRegistryReader::new();
+    let mut fs = init_virtual_fs();
+    let sftw_file = read_software_hive(&mut fs);
+    reader.set_software(HiveFiles::new(PathBuf::new(), sftw_file).unwrap());
+    Box::new(reader)
+}
+
 #[test]
 fn should_open_keys_in_sam_hive() {
     let mut reader = prepare_sam_reader();
@@ -57,6 +65,16 @@ fn should_open_keys_in_sam_hive() {
 fn should_enumerate_values_in_sam_hive() {
     let mut reader = prepare_sam_reader();
     enumerate_keys_test(&mut reader);
+}
+
+#[test]
+fn should_enumerate_values_in_software_hive() {
+    // SOFTWARE is a Big file, should be migrated to Git LFS
+    if !std::path::Path::new("./artifacts/C/Windows/System32/Config/SOFTWARE").exists() {
+        return
+    }
+    let mut reader = prepare_software_reader();
+    enumerate_software_keys_test(&mut reader);
 }
 
 #[test]
@@ -158,4 +176,13 @@ fn open_keys_user_super_secret_admin(reader: &mut Box<dyn RegistryReader>) {
         admin_keys
     );
     // Volatile Environment is populated when logon
+}
+
+fn enumerate_software_keys_test(reader: &mut Box<dyn RegistryReader>) {
+    let current_version_run = reader.open_key(HKLM, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run").unwrap();
+    //let pepe_contento = reader.open_key(user_names, "pepe.contento.secret").unwrap();
+    let names = reader.enumerate_values(current_version_run).unwrap();
+    assert_eq!(2, names.len());
+    assert_eq!("SecurityHealth", names[0]);
+    assert_eq!("VBoxTray", names[1]);
 }

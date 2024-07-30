@@ -951,7 +951,10 @@ impl RegistryReader for HiveRegistryReader {
         }
         let mut data = None;
         for offset in offsets {
-            let value_cell = borrow_hive.get_cell_or_native_at_offset(offset as u64)?;
+            let value_cell = match borrow_hive.get_cell_or_native_at_offset(offset as u64) {
+                Ok(v) => v,
+                Err(_) => continue
+            };
             match value_cell {
                 HiveCell::KeyValue(kv) => {
                     if kv.value_name == value_name {
@@ -1137,13 +1140,19 @@ impl RegistryReader for HiveRegistryReader {
             }
         }
         for offset in offsets {
-            let value_cell = borrow_hive.get_cell_or_native_at_offset(offset as u64)?;
+            let value_cell = match borrow_hive.get_cell_or_native_at_offset(offset as u64) {
+                Ok(v) => v,
+                Err(_) => continue
+            };
             match value_cell {
                 HiveCell::KeyValue(kv) => {
                     values_names.push(kv.value_name.clone());
                 }
                 _ => continue,
             }
+        }
+        if values_names.len() > number_key_values as usize {
+            notify_low!(NotificationType::SuspiciousArtifact ,"There are more elements ({}) than the key indicates ({})", values_names.len(), number_key_values);
         }
 
         Ok(values_names)
