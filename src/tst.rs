@@ -34,6 +34,13 @@ pub(crate) fn read_supersecretadmin_hive(
         .unwrap()
 }
 
+pub(crate) fn read_hive_from_path(
+    path : &Path,
+    fs: &mut Box<dyn VirtualFileSystem>,
+) -> Box<dyn VirtualFile> {
+    fs.open(path).unwrap()
+}
+
 pub fn str_to_unicode_with_ending(txt: &[u8]) -> Vec<u8> {
     let mut v = Vec::with_capacity(txt.len() * 2 + 2);
     for c in txt {

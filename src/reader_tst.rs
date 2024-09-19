@@ -1,7 +1,6 @@
 use super::*;
 use forensic_rs::{
-    notifications,
-    traits::registry::HKU,
+    notifications, traits::registry::HKU
 };
 
 use crate::{hive::read_base_block, tst::*};
@@ -54,6 +53,43 @@ fn prepare_software_reader() -> Box<dyn RegistryReader> {
     reader.set_software(HiveFiles::new(PathBuf::new(), sftw_file).unwrap());
     Box::new(reader)
 }
+fn prepare_full_reader() -> Box<dyn RegistryReader> {
+    let mut reader = HiveRegistryReader::new();
+    let mut fs = init_virtual_fs();
+    if std::path::Path::new("./artifacts/C/Windows/System32/Config/SOFTWARE").exists() {
+        let sftw_file = read_software_hive(&mut fs);
+        reader.set_software(HiveFiles::new(PathBuf::new(), sftw_file).unwrap());
+    }
+    if std::path::Path::new("./artifacts/C/Windows/System32/Config/SAM").exists() {
+        let sam_file = read_sam_hive(&mut fs);
+        reader.set_sam(HiveFiles::new(PathBuf::new(), sam_file).unwrap());
+    }
+    if std::path::Path::new("./artifacts/C/Windows/System32/Config/SECURITY").exists() {
+        let sec_file = read_sec_hive(&mut fs);
+        reader.set_security(HiveFiles::new(PathBuf::new(), sec_file).unwrap());
+    }
+    if std::path::Path::new("./artifacts/C/Windows/System32/Config/SYSTEM").exists() {
+        let sys_file = read_sec_hive(&mut fs);
+        reader.set_system(HiveFiles::new(PathBuf::new(), sys_file).unwrap());
+    }
+    if let Ok(readdir) = std::fs::read_dir(std::path::Path::new("./artifacts/C/Users")) {
+        for user in readdir {
+            let user = match user {
+                Ok(v) => v,
+                Err(_) => continue
+            };
+            let pth = user.path().join("NTUSER.DAT");
+            if pth.exists() {
+                let pth = format!("C:\\Users\\{}\\NTUSER.DAT", user.file_name().to_str().unwrap_or_default());
+                let usr_file = read_hive_from_path(std::path::Path::new(&pth), &mut fs);
+                reader.add_user(user.file_name().to_str().unwrap_or_default(), HiveFiles::new(PathBuf::new(), usr_file).unwrap());
+            }
+        }
+    }
+    
+    
+    Box::new(reader)
+}
 
 #[test]
 fn should_open_keys_in_sam_hive() {
@@ -75,6 +111,28 @@ fn should_enumerate_values_in_software_hive() {
     }
     let mut reader = prepare_software_reader();
     enumerate_software_keys_test(&mut reader);
+}
+
+#[test]
+fn should_not_panic_on_unexistent_key() {
+    if !std::path::Path::new("./artifacts/C/Windows/System32/Config/SOFTWARE").exists() {
+        return
+    }
+    let reader = prepare_full_reader();
+    let _ = reader.open_key(HKLM, r"SOFTWARE\Microsoft\Windows\CurrentVersion\RunUnexistent").unwrap_err();
+    let _ = reader.open_key(HKLM, r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon").unwrap();
+    let run_key = reader.open_key(HKLM, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run").unwrap();
+    let _ = reader.read_value(run_key, r"NonExistent").unwrap_err();
+    let ifeo = reader.open_key(HKLM, r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options").unwrap();
+    let ifeo_keys = reader.enumerate_keys(ifeo).unwrap();
+    for key in ifeo_keys {
+        let subkey = reader.open_key(ifeo, &key).unwrap();
+        for value_name in reader.enumerate_values(subkey).unwrap() {
+            let value = reader.read_value(subkey, &value_name).unwrap();
+            println!("HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options\\{}\\{}={:?}", key, value_name, value);
+        }
+        reader.close_key(subkey);
+    }
 }
 
 #[test]

@@ -293,6 +293,9 @@ pub fn peek_cell(data : &[u8]) -> usize {
 }
 
 pub fn read_cell(data: &[u8], offset: u64) -> ForensicResult<HiveCell> {
+    if data.len() < 6 {
+        return Err(ForensicError::bad_format_str("Invalid Cell: too small"))
+    }
     let cell_len_i = i32::from_ne_bytes(data[..4].try_into().unwrap_or_default());
     let cell_len = cell_len_i.unsigned_abs() as usize;
     if cell_len_i >= 0 {
@@ -334,6 +337,9 @@ pub fn read_cell(data: &[u8], offset: u64) -> ForensicResult<HiveCell> {
 }
 
 pub fn read_index_leaf_cell(data: &[u8], offset: u64) -> ForensicResult<IndexLeafCell> {
+    if data.len() < 4 {
+        return Err(ForensicError::bad_format_str("Invalid IndexLeafCell: too small"))
+    }
     let signature = &data[0..2];
     if signature != INDEX_LEAF_SIGNATURE {
         return Err(ForensicError::bad_format_str("Invalid IndexLeafCell: invalid signature"));
@@ -355,6 +361,9 @@ pub fn read_index_leaf_cell(data: &[u8], offset: u64) -> ForensicResult<IndexLea
 }
 
 pub fn read_fast_leaf_cell(data: &[u8], offset: u64) -> ForensicResult<FastLeafCell> {
+    if data.len() < 4 {
+        return Err(ForensicError::bad_format_str("Invalid FastLeafCell: too small"))
+    }
     let signature = &data[0..2];
     if signature != FAST_LEAF_SIGNATURE {
         return Err(ForensicError::bad_format_str("Invalid FastLeafCell: invalid signature"));
@@ -384,6 +393,9 @@ pub fn read_fast_leaf_cell(data: &[u8], offset: u64) -> ForensicResult<FastLeafC
 }
 
 pub fn read_hash_leaf_cell(data: &[u8], offset: u64) -> ForensicResult<HashLeafCell> {
+    if data.len() < 4 {
+        return Err(ForensicError::bad_format_str("Invalid HashLeafCell: too small"))
+    }
     let signature = &data[0..2];
     if signature != HASH_LEAF_SIGNATURE {
         return Err(ForensicError::bad_format_str("Invalid HashLeafCell: invalid signature"));
@@ -406,6 +418,9 @@ pub fn read_hash_leaf_cell(data: &[u8], offset: u64) -> ForensicResult<HashLeafC
 }
 
 pub fn read_index_root_cell(data: &[u8], offset: u64) -> ForensicResult<IndexRootCell> {
+    if data.len() < 4 {
+        return Err(ForensicError::bad_format_str("Invalid IndexRootCell: too small"))
+    }
     let signature = &data[0..2];
     if signature != INDEX_ROOT_SIGNATURE {
         return Err(ForensicError::bad_format_str("Invalid IndexRootCell: invalid signature"));
@@ -429,6 +444,9 @@ pub fn read_index_root_cell(data: &[u8], offset: u64) -> ForensicResult<IndexRoo
 }
 
 pub fn read_key_node_cell(data: &[u8], offset: u64) -> ForensicResult<KeyNodeCell> {
+    if data.len() < 76 {
+        return Err(ForensicError::bad_format_str("Invalid KeyNode: too small"))
+    }
     let signature = &data[0..2];
     if signature != KEY_NODE_SIGNATURE {
         return Err(ForensicError::bad_format_str("Invalid KeyNode: invalid signature"));
@@ -456,6 +474,9 @@ pub fn read_key_node_cell(data: &[u8], offset: u64) -> ForensicResult<KeyNodeCel
 }
 
 pub fn read_key_security_cell(data: &[u8], offset: u64) -> ForensicResult<KeySecurityCell> {
+    if data.len() < 76 {
+        return Err(ForensicError::bad_format_str("Invalid KeySecurityCell: too small"))
+    }
     let signature = &data[0..2];
     if signature != KEY_SECURITY_SIGNATURE {
         return Err(ForensicError::bad_format_str("Invalid KeySecurityCell: invalid signature"));
@@ -478,6 +499,9 @@ pub fn read_key_security_cell(data: &[u8], offset: u64) -> ForensicResult<KeySec
 }
 
 pub fn read_key_value_cell(data: &[u8], offset: u64) -> ForensicResult<KeyValueCell> {
+    if data.len() < 20 {
+        return Err(ForensicError::bad_format_str("Invalid KeyValueCell: too small"))
+    }
     let signature = &data[0..2];
     if signature != KEY_VALUE_SIGNATURE {
         return Err(ForensicError::bad_format_str("Invalid KeyValueCell: invalid signature"));
