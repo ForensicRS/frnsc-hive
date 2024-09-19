@@ -54,41 +54,9 @@ fn prepare_software_reader() -> Box<dyn RegistryReader> {
     Box::new(reader)
 }
 fn prepare_full_reader() -> Box<dyn RegistryReader> {
-    let mut reader = HiveRegistryReader::new();
-    let mut fs = init_virtual_fs();
-    if std::path::Path::new("./artifacts/C/Windows/System32/Config/SOFTWARE").exists() {
-        let sftw_file = read_software_hive(&mut fs);
-        reader.set_software(HiveFiles::new(PathBuf::new(), sftw_file).unwrap());
-    }
-    if std::path::Path::new("./artifacts/C/Windows/System32/Config/SAM").exists() {
-        let sam_file = read_sam_hive(&mut fs);
-        reader.set_sam(HiveFiles::new(PathBuf::new(), sam_file).unwrap());
-    }
-    if std::path::Path::new("./artifacts/C/Windows/System32/Config/SECURITY").exists() {
-        let sec_file = read_sec_hive(&mut fs);
-        reader.set_security(HiveFiles::new(PathBuf::new(), sec_file).unwrap());
-    }
-    if std::path::Path::new("./artifacts/C/Windows/System32/Config/SYSTEM").exists() {
-        let sys_file = read_sec_hive(&mut fs);
-        reader.set_system(HiveFiles::new(PathBuf::new(), sys_file).unwrap());
-    }
-    if let Ok(readdir) = std::fs::read_dir(std::path::Path::new("./artifacts/C/Users")) {
-        for user in readdir {
-            let user = match user {
-                Ok(v) => v,
-                Err(_) => continue
-            };
-            let pth = user.path().join("NTUSER.DAT");
-            if pth.exists() {
-                let pth = format!("C:\\Users\\{}\\NTUSER.DAT", user.file_name().to_str().unwrap_or_default());
-                let usr_file = read_hive_from_path(std::path::Path::new(&pth), &mut fs);
-                reader.add_user(user.file_name().to_str().unwrap_or_default(), HiveFiles::new(PathBuf::new(), usr_file).unwrap());
-            }
-        }
-    }
-    
-    
-    Box::new(reader)
+    let reader = HiveRegistryReader::new();
+    let fs = init_virtual_fs();
+    reader.from_fs(fs).unwrap()
 }
 
 #[test]
@@ -120,7 +88,8 @@ fn should_not_panic_on_unexistent_key() {
     }
     let reader = prepare_full_reader();
     let _ = reader.open_key(HKLM, r"SOFTWARE\Microsoft\Windows\CurrentVersion\RunUnexistent").unwrap_err();
-    let _ = reader.open_key(HKLM, r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon").unwrap();
+    let winlogon = reader.open_key(HKLM, r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon").unwrap();
+    println!("{:?}", reader.enumerate_values(winlogon).unwrap());
     let run_key = reader.open_key(HKLM, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run").unwrap();
     let _ = reader.read_value(run_key, r"NonExistent").unwrap_err();
     let ifeo = reader.open_key(HKLM, r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options").unwrap();
@@ -132,6 +101,18 @@ fn should_not_panic_on_unexistent_key() {
             println!("HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options\\{}\\{}={:?}", key, value_name, value);
         }
         reader.close_key(subkey);
+    }
+    for user in reader.enumerate_keys(RegHiveKey::HkeyUsers).unwrap() {
+        println!("User: {}", user);
+        let winlogon = format!("{}\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon", user);
+        let ukey = match reader.open_key(RegHiveKey::HkeyUsers, &winlogon) {
+            Ok(v) => v,
+            Err(_) => continue
+        };
+        for winval in reader.enumerate_values(ukey).unwrap() {
+            let value = reader.read_value(ukey, &winval).unwrap();
+            println!("HKU\\{}.{} = {:?}", winlogon, winval, value)
+        }
     }
 }
 
@@ -172,7 +153,10 @@ fn enumerate_keys_test(reader: &mut Box<dyn RegistryReader>) {
 
 fn enumerate_keys_local_machine(reader: &mut Box<dyn RegistryReader>) {
     let subkeys = reader.enumerate_keys(HKLM).expect("Should enumerate HKLM subkeys");
+    println!("{:?}", subkeys);
     assert!(subkeys.len() > 0);
+    let values = reader.enumerate_values(HKLM).expect("Should enumerate HKLM values");
+    assert!(values.len() == 0);
 }
 
 fn open_keys_sam_hive(reader: &mut Box<dyn RegistryReader>) {

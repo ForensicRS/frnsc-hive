@@ -10,7 +10,11 @@ use forensic_rs::{
     notify_informational, notify_low,
     prelude::{ForensicError, ForensicResult, RegHiveKey, RegValue, RegistryReader, HKLM},
     trace,
-    traits::{registry::RegistryKeyInfo, vfs::{VirtualFile, VirtualFileSystem}}, utils::time::Filetime,
+    traits::{
+        registry::RegistryKeyInfo,
+        vfs::{VirtualFile, VirtualFileSystem},
+    },
+    utils::time::Filetime,
 };
 
 use crate::{
@@ -162,7 +166,6 @@ impl HiveRegistryReader {
             r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList",
         )?;
         let guid_list = self.enumerate_keys(user_names_key)?;
-
         for user_guid in &guid_list {
             let profile = self.open_key(user_names_key, user_guid)?;
             let profile_path: String = match self.read_value(profile, "ProfileImagePath") {
@@ -209,6 +212,28 @@ impl HiveRegistryReader {
         }
         Ok(())
     }
+
+    pub fn list_hklm_values(&self) -> ForensicResult<Vec<String>> {
+        Ok(Vec::new())
+    }
+
+    pub fn list_hklm_keys(&self) -> ForensicResult<Vec<String>> {
+        let mut ret = Vec::with_capacity(4);
+        if self.system.is_some() {
+            ret.push("SYSTEM".into());
+        }
+        if self.security.is_some() {
+            ret.push("SECURITY".into());
+        }
+        if self.software.is_some() {
+            ret.push("SOFTWARE".into());
+        }
+        if self.sam.is_some() {
+            ret.push("SAM".into());
+        }
+        Ok(ret)
+    }
+
     /// Sets the SAM HIVE
     pub fn set_sam(&mut self, hive: HiveFiles) {
         trace!("Loaded SAM hive");
@@ -322,6 +347,7 @@ impl HiveRegistryReader {
     }
 }
 
+#[derive(Debug)]
 pub enum SelectedHive {
     None,
     Sam(i64),
@@ -411,7 +437,7 @@ impl HiveFiles {
         }
         let offset = offset as u64;
         if offset == 32 && key_name.is_empty() {
-            return Ok(32)
+            return Ok(32);
         }
         let mut path_separator = key_name.split(|v| v == '\\');
         let root_cell = match self.get_cell_at_offset(offset)? {
@@ -441,24 +467,26 @@ impl HiveFiles {
                         if path_hash == el.name_hash {
                             offset_path.push((next_offset, 0));
                             next_offset = el.offset;
-                            continue 'out
+                            continue 'out;
                         }
                     }
                     let (last_offset, counter) = match offset_path.pop() {
                         Some(v) => v,
-                        None => return Err(ForensicError::missing_str("Cannot find registry key"))
+                        None => return Err(ForensicError::missing_str("Cannot find registry key")),
                     };
                     next_offset = last_offset;
                     subkey_last_index = counter + 1;
-                },
+                }
                 HiveCell::KeyNode(kn) => {
                     if subkey_last_index > 0 {
-                        return Err(ForensicError::missing_str("Cannot find registry key"))
+                        return Err(ForensicError::missing_str("Cannot find registry key"));
                     }
                     if kn.key_name != actual_path {
                         let (last_offset, counter) = match offset_path.pop() {
                             Some(v) => v,
-                            None => return Err(ForensicError::missing_str("Cannot find registry key"))
+                            None => {
+                                return Err(ForensicError::missing_str("Cannot find registry key"))
+                            }
                         };
                         next_offset = last_offset;
                         subkey_last_index = counter + 1;
@@ -471,7 +499,7 @@ impl HiveFiles {
                         }
                         None => break,
                     }
-                },
+                }
                 HiveCell::FastLeaf(fl) => {
                     let mut i = subkey_last_index;
                     for el in fl.elements.iter().skip(i) {
@@ -479,47 +507,47 @@ impl HiveFiles {
                             offset_path.push((next_offset, i));
                             subkey_last_index = 0;
                             next_offset = el.offset;
-                            continue 'out
+                            continue 'out;
                         }
                         i += 1;
                     }
                     let (last_offset, counter) = match offset_path.pop() {
                         Some(v) => v,
-                        None => return Err(ForensicError::missing_str("Cannot find registry key"))
+                        None => return Err(ForensicError::missing_str("Cannot find registry key")),
                     };
                     next_offset = last_offset;
                     subkey_last_index = counter + 1;
-                },
+                }
                 HiveCell::IndexRoot(ir) => {
                     let i = subkey_last_index;
                     for el in ir.elements.iter().skip(i) {
                         offset_path.push((next_offset, i));
                         subkey_last_index = 0;
                         next_offset = el.subkeys_list_offset;
-                        continue 'out
+                        continue 'out;
                     }
                     let (last_offset, counter) = match offset_path.pop() {
                         Some(v) => v,
-                        None => return Err(ForensicError::missing_str("Cannot find registry key"))
+                        None => return Err(ForensicError::missing_str("Cannot find registry key")),
                     };
                     next_offset = last_offset;
                     subkey_last_index = counter + 1;
-                },
+                }
                 HiveCell::IndexLeaf(il) => {
                     let i = subkey_last_index;
                     for el in il.elements.iter().skip(i) {
                         offset_path.push((next_offset, i));
                         subkey_last_index = 0;
                         next_offset = el.offset;
-                        continue 'out
+                        continue 'out;
                     }
                     let (last_offset, counter) = match offset_path.pop() {
                         Some(v) => v,
-                        None => return Err(ForensicError::missing_str("Cannot find registry key"))
+                        None => return Err(ForensicError::missing_str("Cannot find registry key")),
                     };
                     next_offset = last_offset;
                     subkey_last_index = counter + 1;
-                },
+                }
                 _ => return Err(ForensicError::missing_str("Cannot find registry key")),
             };
         }
@@ -600,8 +628,17 @@ impl HiveFiles {
         let mut readed = self.primary.read(&mut self.buffer)?;
         let cell_size = peek_cell(&self.buffer[0..readed]);
         if cell_size > readed {
-            if cell_size > self.base_block.hive_bins_data_size.try_into().unwrap_or_default() {
-                return Err(ForensicError::bad_format_string(format!("Invalid cell size {} at offset {}", cell_size, offset)))
+            if cell_size
+                > self
+                    .base_block
+                    .hive_bins_data_size
+                    .try_into()
+                    .unwrap_or_default()
+            {
+                return Err(ForensicError::bad_format_string(format!(
+                    "Invalid cell size {} at offset {}",
+                    cell_size, offset
+                )));
             }
             if cell_size > self.buffer.len() {
                 self.buffer = vec![0; ((cell_size / 1024) + 1) * 1024];
@@ -629,8 +666,17 @@ impl HiveFiles {
         let mut readed = self.primary.read(&mut self.buffer)?;
         let cell_size = peek_cell(&self.buffer[0..readed]);
         if cell_size > readed {
-            if cell_size > self.base_block.hive_bins_data_size.try_into().unwrap_or_default() {
-                return Err(ForensicError::bad_format_string(format!("Invalid cell size {} at offset {}", cell_size, offset)))
+            if cell_size
+                > self
+                    .base_block
+                    .hive_bins_data_size
+                    .try_into()
+                    .unwrap_or_default()
+            {
+                return Err(ForensicError::bad_format_string(format!(
+                    "Invalid cell size {} at offset {}",
+                    cell_size, offset
+                )));
             }
             if cell_size > self.buffer.len() {
                 self.buffer = vec![0; ((cell_size / 1024) + 1) * 1024];
@@ -801,8 +847,9 @@ impl RegistryReader for HiveRegistryReader {
                         };
                         let hive_key = hive.open_key_from_offset("", root_cell_pos as i64)?;
                         return Ok(RegHiveKey::Hkey(transform_key_with_type_i(
-                            hive_key, HIVE_TYPE_OTHERS,
-                        )))
+                            hive_key,
+                            HIVE_TYPE_OTHERS,
+                        )));
                     }
                     SelectedHive::Sam(offset) => (
                         self.sam
@@ -953,13 +1000,13 @@ impl RegistryReader for HiveRegistryReader {
         for offset in offsets {
             let value_cell = match borrow_hive.get_cell_or_native_at_offset(offset as u64) {
                 Ok(v) => v,
-                Err(_) => continue
+                Err(_) => continue,
             };
             match value_cell {
                 HiveCell::KeyValue(kv) => {
                     if kv.value_name == value_name {
                         data = Some((kv.data_offset, kv.data_size, kv.data_type, kv.flags));
-                        break
+                        break;
                     }
                 }
                 _ => continue,
@@ -980,25 +1027,27 @@ impl RegistryReader for HiveRegistryReader {
                 DATA_TYPE_REG_SZ => {
                     match (data.get(data.len() - 2), data.get(data.len() - 1)) {
                         (Some(0), Some(0)) => {
-                            if data.len() == 2 { // Empty utf16 string
+                            if data.len() == 2 {
+                                // Empty utf16 string
                                 RegValue::SZ(String::new())
-                            }else {
-                                RegValue::SZ(String::from_utf16_lossy(&[u16::from_le_bytes([data[0], data[1]])]))
+                            } else {
+                                RegValue::SZ(String::from_utf16_lossy(&[u16::from_le_bytes([
+                                    data[0], data[1],
+                                ])]))
                             }
-                            
-                        },
-                        (Some(_), Some(0)) => {
-                            RegValue::SZ(String::from_utf8_lossy(&data[..data.len() - 1]).to_string())
-                        },
-                        _ => RegValue::SZ(String::from_utf8_lossy(data).to_string())
+                        }
+                        (Some(_), Some(0)) => RegValue::SZ(
+                            String::from_utf8_lossy(&data[..data.len() - 1]).to_string(),
+                        ),
+                        _ => RegValue::SZ(String::from_utf8_lossy(data).to_string()),
                     }
-                },
+                }
                 DATA_TYPE_REG_DWORD => RegValue::DWord(value),
                 DATA_TYPE_REG_DWORD_BE => RegValue::DWord(value.to_be()),
-                _ => RegValue::DWord(value)
-            })
+                _ => RegValue::DWord(value),
+            });
         }
-        
+
         let data_cell = borrow_hive.get_cell_or_native_at_offset(data_offset as u64)?;
 
         let reg_value = match data_type {
@@ -1023,7 +1072,6 @@ impl RegistryReader for HiveRegistryReader {
                 HiveCell::Invalid(ic) => RegValue::DWord(ic.into_dword_le()),
                 HiveCell::Unallocated(_) => RegValue::DWord(0),
                 _ => todo!(),
-                
             },
             DATA_TYPE_REG_DWORD_BE => match data_cell {
                 HiveCell::Invalid(ic) => RegValue::DWord(ic.into_dword_be()),
@@ -1042,7 +1090,7 @@ impl RegistryReader for HiveRegistryReader {
                     } else {
                         RegValue::SZ(ic.into_reg_sz_extended())
                     }
-                },
+                }
                 HiveCell::Unallocated(_) => RegValue::SZ(String::new()),
                 _ => todo!(),
             },
@@ -1055,6 +1103,12 @@ impl RegistryReader for HiveRegistryReader {
     }
 
     fn enumerate_values(&self, hkey: RegHiveKey) -> ForensicResult<Vec<String>> {
+        let hkey = match hkey {
+            RegHiveKey::HkeyUsers => return Ok(Vec::new()),
+            RegHiveKey::HkeyLocalMachine => return self.list_hklm_values(),
+            RegHiveKey::Hkey(hkey) => RegHiveKey::Hkey(hkey),
+            _ => self.open_key(hkey, "")?,
+        };
         let (mut borrow_hive, offset) = match select_hive_by_hkey(hkey) {
             SelectedHive::None => return Err(ForensicError::missing_str("Invalid hive")),
             SelectedHive::Sam(offset) => (
@@ -1142,7 +1196,7 @@ impl RegistryReader for HiveRegistryReader {
         for offset in offsets {
             let value_cell = match borrow_hive.get_cell_or_native_at_offset(offset as u64) {
                 Ok(v) => v,
-                Err(_) => continue
+                Err(_) => continue,
             };
             match value_cell {
                 HiveCell::KeyValue(kv) => {
@@ -1152,28 +1206,24 @@ impl RegistryReader for HiveRegistryReader {
             }
         }
         if values_names.len() > number_key_values as usize {
-            notify_low!(NotificationType::SuspiciousArtifact ,"There are more elements ({}) than the key indicates ({})", values_names.len(), number_key_values);
+            notify_low!(
+                NotificationType::SuspiciousArtifact,
+                "There are more elements ({}) than the key indicates ({})",
+                values_names.len(),
+                number_key_values
+            );
         }
 
         Ok(values_names)
     }
 
     fn enumerate_keys(&self, hkey: RegHiveKey) -> ForensicResult<Vec<String>> {
-        if hkey == RegHiveKey::HkeyLocalMachine {
-            let mut ret = Vec::with_capacity(4);
-            if self.system.is_some() {
-                ret.push("SYSTEM".into());
+        let hkey = match hkey {
+            RegHiveKey::HkeyUsers => {
+                return Ok(self.users.iter().map(|(v, _)| v.clone()).collect())
             }
-            if self.security.is_some() {
-                ret.push("SECURITY".into());
-            }
-            if self.software.is_some() {
-                ret.push("SOFTWARE".into());
-            }
-            if self.sam.is_some() {
-                ret.push("SAM".into());
-            }
-            return Ok(ret)
+            RegHiveKey::HkeyLocalMachine => return self.list_hklm_keys(),
+            _ => hkey,
         };
         let (mut borrow_hive, offset) = match select_hive_by_hkey(hkey) {
             SelectedHive::None => return Err(ForensicError::missing_str("Invalid hive")),
@@ -1237,32 +1287,25 @@ impl RegistryReader for HiveRegistryReader {
         };
         let subkeys_list_offset = key_node.subkeys_list_offset;
         let mut subkeys = Vec::with_capacity(key_node.number_subkeys as usize);
-        let mut offsets: Vec<u32> = match borrow_hive.get_cell_at_offset(subkeys_list_offset as u64)? {
-            HiveCell::HashLeaf(v) => {
-                v.elements.iter().map(|v| v.offset).collect()
-            }
-            HiveCell::FastLeaf(v) => {
-                v.elements.iter().map(|v| v.offset).collect()
-            }
-            HiveCell::IndexLeaf(v) => {
-                v.elements.iter().map(|v| v.offset).collect()
-            },
-            HiveCell::IndexRoot(v) => {
-                v.elements.iter().map(|v| v.subkeys_list_offset).collect()
-            },
+        let mut offsets: Vec<u32> = match borrow_hive
+            .get_cell_at_offset(subkeys_list_offset as u64)?
+        {
+            HiveCell::HashLeaf(v) => v.elements.iter().map(|v| v.offset).collect(),
+            HiveCell::FastLeaf(v) => v.elements.iter().map(|v| v.offset).collect(),
+            HiveCell::IndexLeaf(v) => v.elements.iter().map(|v| v.offset).collect(),
+            HiveCell::IndexRoot(v) => v.elements.iter().map(|v| v.subkeys_list_offset).collect(),
             _ => {
                 return Err(ForensicError::bad_format_string(format!(
                     "Invalid Cell type at offset={}. Expected Leaf type",
                     offset
                 )))
             }
-            
         };
         let mut pos = 0;
         while pos < offsets.len() {
             let offset = match offsets.get(pos) {
                 Some(v) => *v,
-                None => continue
+                None => continue,
             };
             let cell = match borrow_hive.get_cell_at_offset(offset.into()) {
                 Ok(v) => v,
@@ -1277,15 +1320,13 @@ impl RegistryReader for HiveRegistryReader {
                 }
             };
             match cell {
-                HiveCell::KeyNode(v) => {
-                    subkeys.push(v.key_name.clone())
-                },
+                HiveCell::KeyNode(v) => subkeys.push(v.key_name.clone()),
                 HiveCell::IndexLeaf(v) => {
-                    for el in &v.elements{
+                    for el in &v.elements {
                         offsets.push(el.offset);
                     }
-                },
-                _ => continue
+                }
+                _ => continue,
             };
             pos += 1;
         }
@@ -1357,32 +1398,25 @@ impl RegistryReader for HiveRegistryReader {
         if pos >= number_subkeys {
             return Err(ForensicError::Other("Invalid position".into()));
         }
-        let mut offsets: Vec<u32> = match borrow_hive.get_cell_at_offset(subkeys_list_offset as u64)? {
-            HiveCell::HashLeaf(v) => {
-                v.elements.iter().map(|v| v.offset).collect()
-            }
-            HiveCell::FastLeaf(v) => {
-                v.elements.iter().map(|v| v.offset).collect()
-            }
-            HiveCell::IndexLeaf(v) => {
-                v.elements.iter().map(|v| v.offset).collect()
-            },
-            HiveCell::IndexRoot(v) => {
-                v.elements.iter().map(|v| v.subkeys_list_offset).collect()
-            },
+        let mut offsets: Vec<u32> = match borrow_hive
+            .get_cell_at_offset(subkeys_list_offset as u64)?
+        {
+            HiveCell::HashLeaf(v) => v.elements.iter().map(|v| v.offset).collect(),
+            HiveCell::FastLeaf(v) => v.elements.iter().map(|v| v.offset).collect(),
+            HiveCell::IndexLeaf(v) => v.elements.iter().map(|v| v.offset).collect(),
+            HiveCell::IndexRoot(v) => v.elements.iter().map(|v| v.subkeys_list_offset).collect(),
             _ => {
                 return Err(ForensicError::bad_format_string(format!(
                     "Invalid Cell type at offset={}. Expected Leaf type",
                     offset
                 )))
             }
-            
         };
         let mut pos = pos as usize;
         while pos < offsets.len() {
             let offset = match offsets.get(pos) {
                 Some(v) => *v,
-                None => continue
+                None => continue,
             };
             let cell = match borrow_hive.get_cell_at_offset(offset.into()) {
                 Ok(v) => v,
@@ -1397,15 +1431,13 @@ impl RegistryReader for HiveRegistryReader {
                 }
             };
             match cell {
-                HiveCell::KeyNode(v) => {
-                    return Ok(v.key_name.clone())
-                },
+                HiveCell::KeyNode(v) => return Ok(v.key_name.clone()),
                 HiveCell::IndexLeaf(v) => {
-                    for el in &v.elements{
+                    for el in &v.elements {
                         offsets.push(el.offset);
                     }
-                },
-                _ => continue
+                }
+                _ => continue,
             };
             pos += 1;
         }
@@ -1572,12 +1604,12 @@ impl RegistryReader for HiveRegistryReader {
             }
         };
         Ok(RegistryKeyInfo {
-            last_write_time : Filetime::new(key_node.last_written_timestamp),
-            max_subkey_name_length : key_node.largest_subkey_name_length as u32,
-            max_value_length : key_node.largest_value_data_size,
-            max_value_name_length : key_node.largest_value_name_length,
-            subkeys : key_node.number_subkeys,
-            values : key_node.number_key_values
+            last_write_time: Filetime::new(key_node.last_written_timestamp),
+            max_subkey_name_length: key_node.largest_subkey_name_length as u32,
+            max_value_length: key_node.largest_value_data_size,
+            max_value_name_length: key_node.largest_value_name_length,
+            subkeys: key_node.number_subkeys,
+            values: key_node.number_key_values,
         })
     }
 }
@@ -1607,9 +1639,8 @@ pub(crate) fn select_hive_by_hkey(key: RegHiveKey) -> SelectedHive {
                 HIVE_TYPE_SYSTEM => SelectedHive::System(key_value),
                 HIVE_TYPE_CACHED => SelectedHive::Mounted(key_value),
                 _ => {
-                    let key_id = key_type_u - HIVE_TYPE_OTHERS;
-                    let key_id = key_id >> 1;
-                    let is_user = key_id & 0x1;
+                    let key_id = (key_type_u >> 1) - HIVE_TYPE_OTHERS;
+                    let is_user = key_type_u & 0x1;
                     if is_user == 0 {
                         SelectedHive::Other((key_id, key_value))
                     } else {
