@@ -713,7 +713,24 @@ impl RegistryReader for HiveRegistryReader {
     ) -> ForensicResult<Box<dyn RegistryReader>> {
         HiveRegistryReader::from_fs(fs)
     }
-
+    /// Opens a registry key. If the registry reader is a file based one it needs to do the same thing that the Window Kernel does: store a Map with the association of keys with the path they point to.
+    /// 
+    /// ```rust
+    /// use forensic_rs::prelude::*;
+    /// use frnsc_hive::reader::HiveRegistryReader;
+    /// let fs = Box::new(forensic_rs::core::fs::ChRootFileSystem::new("./artifacts/", Box::new(forensic_rs::core::fs::StdVirtualFS::new())));
+    /// let mut reader = HiveRegistryReader::new().from_fs(fs).unwrap();
+    /// let user_names_key = reader.open_key(HKLM, r"SAM\Domains\Account\Users\Names").expect("Should list all user names");
+    /// let _admin = reader.open_key(user_names_key, "Administrador").unwrap();
+    /// let users = reader.enumerate_keys(user_names_key).expect("Should enumerate users");
+    /// println!("Users: {:?}", users);
+    /// assert_eq!("Administrador", users[0]);
+    /// assert_eq!("DefaultAccount", users[1]);
+    /// assert_eq!("Invitado", users[2]);
+    /// assert_eq!("maria.feliz.secret", users[3]);
+    /// assert_eq!("pepe.contento.secret", users[4]);
+    /// assert_eq!("SuperSecretAdmin", users[5]);
+    /// ```
     fn open_key(&self, hkey: RegHiveKey, mut key_name: &str) -> ForensicResult<RegHiveKey> {
         match hkey {
             RegHiveKey::HkeyLocalMachine => {
