@@ -347,7 +347,7 @@ impl HiveRegistryReader {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum SelectedHive {
     None,
     Sam(i64),
@@ -738,21 +738,21 @@ impl RegistryReader for HiveRegistryReader {
                     Some(v) => v,
                     None => (key_name, ""),
                 };
-                let (hive, hive_type) = if first_key == "SAM" {
+                let (hive, hive_type) = if first_key.eq_ignore_ascii_case("SAM")  {
                     (
                         self.sam
                             .as_ref()
                             .ok_or_else(|| ForensicError::missing_str("Cannot find SAM hive"))?,
                         HIVE_TYPE_SAM,
                     )
-                } else if first_key == "SECURITY" {
+                } else if first_key.eq_ignore_ascii_case("SECURITY") {
                     (
                         self.security.as_ref().ok_or_else(|| {
                             ForensicError::missing_str("Cannot find SECURITY hive")
                         })?,
                         HIVE_TYPE_SECURITY,
                     )
-                } else if first_key == "SOFTWARE" {
+                } else if first_key.eq_ignore_ascii_case("SOFTWARE") {
                     key_name = &key_name[9..];
                     (
                         self.software.as_ref().ok_or_else(|| {
@@ -760,7 +760,7 @@ impl RegistryReader for HiveRegistryReader {
                         })?,
                         HIVE_TYPE_SOFTWARE,
                     )
-                } else if first_key == "SYSTEM" {
+                } else if first_key.eq_ignore_ascii_case("SYSTEM") {
                     (
                         self.system
                             .as_ref()
@@ -834,11 +834,13 @@ impl RegistryReader for HiveRegistryReader {
                     SelectedHive::None => {
                         // Used to open mounted hives
                         let mut cell = None;
+                        let mut pos = 0;
                         for (key, other_cell) in &self.others {
                             if key == key_name {
                                 cell = Some(other_cell);
                                 break;
                             }
+                            pos += 1;
                         }
                         let cell = match cell {
                             Some(v) => v,
@@ -863,10 +865,7 @@ impl RegistryReader for HiveRegistryReader {
                             }
                         };
                         let hive_key = hive.open_key_from_offset("", root_cell_pos as i64)?;
-                        return Ok(RegHiveKey::Hkey(transform_key_with_type_i(
-                            hive_key,
-                            HIVE_TYPE_OTHERS,
-                        )));
+                        return Ok(others_hive_by_position(pos, hive_key));
                     }
                     SelectedHive::Sam(offset) => (
                         self.sam
@@ -1194,6 +1193,9 @@ impl RegistryReader for HiveRegistryReader {
                 )))
             }
         };
+        if key_node.number_key_values == 0 || key_node.key_values_list_offset == 0xFFFFFFFF{
+            return Ok(Vec::new())
+        }
         let number_key_values = key_node.number_key_values;
         let key_values_list_offset = key_node.key_values_list_offset;
         let mut values_names = Vec::with_capacity(number_key_values as usize);
@@ -1645,10 +1647,8 @@ pub(crate) fn select_hive_by_hkey(key: RegHiveKey) -> SelectedHive {
         RegHiveKey::Hkey(ikey) => {
             let key_value = ikey as u64 & 0xffffffffffff;
             let key_type = (ikey >> 48) as u16;
-            let key_type_u = key_type & 0x7fff;
-            let is_mounted = (key_type as u64 >> 15) << 63;
-            let key_value: i64 = (is_mounted | key_value) as i64;
-            match key_type_u {
+            let key_value: i64 = key_value as i64;
+            match key_type {
                 HIVE_TYPE_NONE => SelectedHive::None,
                 HIVE_TYPE_SAM => SelectedHive::Sam(key_value),
                 HIVE_TYPE_SECURITY => SelectedHive::Security(key_value),
@@ -1656,8 +1656,8 @@ pub(crate) fn select_hive_by_hkey(key: RegHiveKey) -> SelectedHive {
                 HIVE_TYPE_SYSTEM => SelectedHive::System(key_value),
                 HIVE_TYPE_CACHED => SelectedHive::Mounted(key_value),
                 _ => {
-                    let key_id = (key_type_u >> 1) - HIVE_TYPE_OTHERS;
-                    let is_user = key_type_u & 0x1;
+                    let key_id = (key_type  - HIVE_TYPE_OTHERS) & 0x7fff;
+                    let is_user = key_type >> 15;
                     if is_user == 0 {
                         SelectedHive::Other((key_id, key_value))
                     } else {
@@ -1670,13 +1670,14 @@ pub(crate) fn select_hive_by_hkey(key: RegHiveKey) -> SelectedHive {
     }
 }
 pub(crate) fn user_hive_by_position(position: u16, offset: isize) -> RegHiveKey {
-    let key_id = (position + HIVE_TYPE_OTHERS) << 1;
-    let key_id = key_id | 0x01;
-    RegHiveKey::Hkey(offset | (key_id as isize) << 48)
+    let key_id = (position + HIVE_TYPE_OTHERS) | 0x8000;
+    let res = offset | (key_id as isize) << 48;
+    RegHiveKey::Hkey(res)
 }
 pub(crate) fn others_hive_by_position(position: u16, offset: isize) -> RegHiveKey {
-    let key_id = (position + HIVE_TYPE_OTHERS) << 1;
-    RegHiveKey::Hkey(offset | (key_id as isize) << 48)
+    let key_id = position + HIVE_TYPE_OTHERS;
+    let res = offset | (key_id as isize) << 48;
+    RegHiveKey::Hkey(res)
 }
 
 pub fn open_hive_with_logs(
