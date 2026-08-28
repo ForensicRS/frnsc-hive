@@ -1,4 +1,19 @@
-use forensic_rs::{err::ForensicError, prelude::ForensicResult};
+//! Parses individual REGF cells: the `nk`/`vk`/`sk`/`li`/`lf`/`lh`/`ri`-signed structures that
+//! make up a hive bin's contents (see [crate::hive] for the bin-level framing around them).
+//!
+//! Each recognized cell type implements [FromBytes], decoded directly off a [ByteReader] cursor
+//! (fixed header fields first, then any variable-length trailing data such as a key/value name or
+//! a security descriptor, read off the same cursor). [read_cell] dispatches on the 2-byte
+//! signature to the matching `read_*_cell` function and wraps the result in the [HiveCell] enum;
+//! an unrecognized signature becomes [HiveCell::Invalid] (its raw bytes are kept as-is — this is
+//! also how a `KeyValue`'s resident data cell is represented, since it has no signature of its
+//! own) and a positive cell-size prefix (meaning "unallocated") becomes [HiveCell::Unallocated].
+//!
+//! [BigDataCell]/the `db` signature is defined per the format spec but never produced by
+//! [read_cell] — chunked "big data" values (values too large to store in one cell) are not
+//! currently decoded.
+
+use forensic_rs::prelude::{ByteReader, ForensicError, ForensicResult, FromBytes};
 pub const INDEX_LEAF_SIGNATURE: &[u8; 2] = b"li";
 pub const FAST_LEAF_SIGNATURE: &[u8; 2] = b"lf";
 pub const HASH_LEAF_SIGNATURE: &[u8; 2] = b"lh";
@@ -192,54 +207,6 @@ pub struct KeyNodeCell {
     pub offset: u64,
 }
 
-#[repr(C, packed)]
-pub struct KeyNodeCellPacked {
-    /// Signature "nk". ASCII string
-    pub signature: u16,
-    /// Flags. Bit mask, see below
-    pub flags: u16,
-    /// Last written timestamp. FILETIME (UTC)
-    pub last_written_timestamp: u64,
-    /// Access bits. Bit mask, see below (this field is used as of Windows 8 and Windows Server 2012; in previous versions of Windows, this field is reserved and called Spare)
-    pub access_bits: u32,
-    /// Parent. Offset of a parent key node in bytes, relative from the start of the hive bins data (this field has no meaning on a disk for a root key node)
-    pub parent: u32,
-    /// Number of subkeys
-    pub number_subkeys: u32,
-    /// Number of volatile subkeys
-    pub number_volatile_subkeys: u32,
-    /// Subkeys list offset. In bytes, relative from the start of the hive bins data (also, this field may point to an Index root)
-    pub subkeys_list_offset: u32,
-    /// Volatile subkeys list offset. This field has no meaning on a disk (volatile keys are not written to a file)
-    pub volatile_subkeys_list_offset: u32,
-    /// Number of key values
-    pub number_key_values: u32,
-    /// Key values list offset. In bytes, relative from the start of the hive bins data
-    pub key_values_list_offset: u32,
-    /// Key security offset. In bytes, relative from the start of the hive bins data
-    pub key_security_offset: u32,
-    /// Class name offset. n bytes, relative from the start of the hive bins data
-    pub class_name_offset: u32,
-    /// Largest subkey class name length. In bytes
-    pub largest_subkey_class_name_length: u32,
-    /// Largest subkey name length. In bytes, a subkey name is treated as a UTF-16LE string.
-    /// Starting from Windows Vista, Windows Server 2003 SP2, and Windows XP SP3, the Largest subkey name length field has been split into 4 bit fields
-    pub largest_subkey_name_length: u16,
-    /// Virtualization control flags and User flags (Wow64 flags)
-    pub virt_and_user_flags: u8,
-    /// Enabling Breakpoints for Registry Keys using the CmpRegDebugBreakEnabled kernel variable
-    pub debug: u8,
-    /// Largest value name length. In bytes, a value name is treated as a UTF-16LE string
-    pub largest_value_name_length: u32,
-    /// Largest value data size. In bytes
-    pub largest_value_data_size: u32,
-    /// WorkVar. Cached index
-    pub work_var: u32,
-    /// Key name length. In bytes
-    pub key_name_length: u16,
-    /// Class name length. In bytes
-    pub class_name_length: u16,
-}
 #[derive(Debug, Clone)]
 pub struct KeyValueCell {
     pub name_length: u16,
@@ -250,16 +217,6 @@ pub struct KeyValueCell {
     pub value_name: String,
     pub offset: u64,
 }
-#[repr(C, packed)]
-pub struct KeyValueCellPacked {
-    pub signature: u16,
-    pub name_length: u16,
-    pub data_size: u32,
-    pub data_offset: u32,
-    pub data_type: u32,
-    pub flags: u16,
-    pub spare: u16,
-}
 #[derive(Debug, Clone)]
 pub struct KeySecurityCell {
     pub flink: u32,
@@ -269,390 +226,326 @@ pub struct KeySecurityCell {
     pub sec_desc: Vec<u8>,
     pub offset: u64,
 }
-#[repr(C, packed)]
-pub struct KeySecurityCellPacked {
-    pub signature: u16,
-    pub reserved: u16,
-    pub flink: u32,
-    pub blink: u32,
-    pub ref_count: u32,
-    pub sec_desc_size: u32,
-}
 #[derive(Debug, Clone)]
 pub struct BigDataCell {
     pub offset: u64,
 }
 
-pub fn peek_cell(data : &[u8]) -> usize {
-    if data.len() < 4 {
-        return 0
+/// Reads a `len`-byte extended-ASCII (Latin-1, byte value == codepoint) name off `reader`. Kept
+/// as a hand-rolled `from_utf8_lossy`-equivalent rather than [ByteReader::read_ascii_string]
+/// (Latin-1 passthrough, never fails) to preserve today's exact decode behavior (best-effort
+/// UTF-8, only the genuinely-invalid sequences get replaced) — a real correctness question
+/// (which interpretation better matches the format spec) is left for a follow-up, not decided
+/// silently as a side effect of this migration.
+fn read_extended_ascii_name(reader: &mut ByteReader, len: usize) -> ForensicResult<String> {
+    Ok(String::from_utf8_lossy(reader.read_bytes(len)?).to_string())
+}
+
+impl FromBytes for IndexLeafCell {
+    fn from_bytes(reader: &mut ByteReader) -> ForensicResult<Self> {
+        let signature = reader.read_bytes(2)?;
+        if signature != INDEX_LEAF_SIGNATURE {
+            return Err(ForensicError::registry_cell_error("index_leaf", "invalid signature"));
+        }
+        let n_elements = reader.read_u16_le()?;
+        let mut elements = Vec::with_capacity(n_elements.into());
+        for _ in 0..n_elements {
+            elements.push(IndexLeafListElements {
+                offset: reader.read_u32_le()?,
+            });
+        }
+        Ok(IndexLeafCell { elements, offset: 0 })
     }
-    let cell_len_i = i32::from_ne_bytes(data[..4].try_into().unwrap_or_default());
-    let cell_len = cell_len_i.unsigned_abs() as usize;
-    cell_len
+}
+
+impl FromBytes for FastLeafCell {
+    fn from_bytes(reader: &mut ByteReader) -> ForensicResult<Self> {
+        let signature = reader.read_bytes(2)?;
+        if signature != FAST_LEAF_SIGNATURE {
+            return Err(ForensicError::registry_cell_error("fast_leaf", "invalid signature"));
+        }
+        let n_elements = reader.read_u16_le()?;
+        let mut elements = Vec::with_capacity(n_elements.into());
+        for _ in 0..n_elements {
+            let offset = reader.read_u32_le()?;
+            let raw = reader.read_bytes(4)?;
+            let end = raw.iter().position(|&v| v == 0).unwrap_or(4);
+            let name_hint = String::from_utf8_lossy(&raw[..end]).to_string();
+            elements.push(FastLeafListElements { offset, name_hint });
+        }
+        Ok(FastLeafCell { elements, offset: 0 })
+    }
+}
+
+impl FromBytes for HashLeafCell {
+    fn from_bytes(reader: &mut ByteReader) -> ForensicResult<Self> {
+        let signature = reader.read_bytes(2)?;
+        if signature != HASH_LEAF_SIGNATURE {
+            return Err(ForensicError::registry_cell_error("hash_leaf", "invalid signature"));
+        }
+        let n_elements = reader.read_u16_le()?;
+        let mut elements = Vec::with_capacity(n_elements.into());
+        for _ in 0..n_elements {
+            let offset = reader.read_u32_le()?;
+            let name_hash = reader.read_u32_le()?;
+            elements.push(HashLeafListElements { offset, name_hash });
+        }
+        Ok(HashLeafCell { elements, offset: 0 })
+    }
+}
+
+impl FromBytes for IndexRootCell {
+    fn from_bytes(reader: &mut ByteReader) -> ForensicResult<Self> {
+        let signature = reader.read_bytes(2)?;
+        if signature != INDEX_ROOT_SIGNATURE {
+            return Err(ForensicError::registry_cell_error("index_root", "invalid signature"));
+        }
+        let n_elements = reader.read_u16_le()?;
+        let mut elements = Vec::with_capacity(n_elements.into());
+        for _ in 0..n_elements {
+            elements.push(IndexRootSubkeyOffset {
+                subkeys_list_offset: reader.read_u32_le()?,
+            });
+        }
+        Ok(IndexRootCell { elements, offset: 0 })
+    }
+}
+
+impl FromBytes for KeyNodeCell {
+    fn from_bytes(reader: &mut ByteReader) -> ForensicResult<Self> {
+        let signature = reader.read_bytes(2)?;
+        if signature != KEY_NODE_SIGNATURE {
+            return Err(ForensicError::registry_cell_error("key_node", "invalid signature"));
+        }
+        let flags = reader.read_u16_le()?;
+        let last_written_timestamp = reader.read_u64_le()?;
+        let access_bits = reader.read_u32_le()?;
+        let parent = reader.read_u32_le()?;
+        let number_subkeys = reader.read_u32_le()?;
+        let number_volatile_subkeys = reader.read_u32_le()?;
+        let subkeys_list_offset = reader.read_u32_le()?;
+        let volatile_subkeys_list_offset = reader.read_u32_le()?;
+        let number_key_values = reader.read_u32_le()?;
+        let key_values_list_offset = reader.read_u32_le()?;
+        let key_security_offset = reader.read_u32_le()?;
+        let class_name_offset = reader.read_u32_le()?;
+        let largest_subkey_class_name_length = reader.read_u32_le()?;
+        let largest_subkey_name_length = reader.read_u16_le()?;
+        let virt_and_user_flags = reader.read_u8()?;
+        let debug = reader.read_u8()?;
+        let largest_value_name_length = reader.read_u32_le()?;
+        let largest_value_data_size = reader.read_u32_le()?;
+        let work_var = reader.read_u32_le()?;
+        let key_name_length = reader.read_u16_le()?;
+        let class_name_length = reader.read_u16_le()?;
+        let key_name = if flags & KEY_COMP_NAME_FLAG == 0 {
+            reader.read_utf16le_string(key_name_length as usize)?
+        } else {
+            read_extended_ascii_name(reader, key_name_length as usize)?
+        };
+        Ok(KeyNodeCell {
+            flags,
+            last_written_timestamp,
+            access_bits,
+            parent,
+            number_subkeys,
+            number_volatile_subkeys,
+            subkeys_list_offset,
+            volatile_subkeys_list_offset,
+            number_key_values,
+            key_values_list_offset,
+            key_security_offset,
+            class_name_offset,
+            largest_subkey_class_name_length,
+            largest_subkey_name_length,
+            virt_and_user_flags,
+            debug,
+            largest_value_name_length,
+            largest_value_data_size,
+            work_var,
+            key_name_length,
+            class_name_length,
+            key_name,
+            offset: 0,
+        })
+    }
+}
+
+impl FromBytes for KeyValueCell {
+    fn from_bytes(reader: &mut ByteReader) -> ForensicResult<Self> {
+        let signature = reader.read_bytes(2)?;
+        if signature != KEY_VALUE_SIGNATURE {
+            return Err(ForensicError::registry_cell_error("key_value", "invalid signature"));
+        }
+        let name_length = reader.read_u16_le()?;
+        let data_size = reader.read_u32_le()?;
+        let data_offset = reader.read_u32_le()?;
+        let data_type = reader.read_u32_le()?;
+        let flags = reader.read_u16_le()?;
+        let _spare = reader.read_u16_le()?;
+        let value_name = if name_length != 0 {
+            if flags & VALUE_COMP_NAME_FLAG == 0 {
+                reader.read_utf16le_string(name_length as usize)?
+            } else {
+                read_extended_ascii_name(reader, name_length as usize)?
+            }
+        } else {
+            String::new()
+        };
+        Ok(KeyValueCell {
+            name_length,
+            data_size,
+            data_offset,
+            data_type,
+            flags,
+            value_name,
+            offset: 0,
+        })
+    }
+}
+
+impl FromBytes for KeySecurityCell {
+    fn from_bytes(reader: &mut ByteReader) -> ForensicResult<Self> {
+        let signature = reader.read_bytes(2)?;
+        if signature != KEY_SECURITY_SIGNATURE {
+            return Err(ForensicError::registry_cell_error("key_security", "invalid signature"));
+        }
+        let _reserved = reader.read_u16_le()?;
+        let flink = reader.read_u32_le()?;
+        let blink = reader.read_u32_le()?;
+        let ref_count = reader.read_u32_le()?;
+        let sec_desc_size = reader.read_u32_le()?;
+        let sec_desc = reader.read_bytes(sec_desc_size as usize)?.to_vec();
+        Ok(KeySecurityCell {
+            flink,
+            blink,
+            ref_count,
+            sec_desc_size,
+            sec_desc,
+            offset: 0,
+        })
+    }
+}
+
+pub fn peek_cell(data: &[u8]) -> usize {
+    let mut reader = ByteReader::new(data);
+    match reader.read_i32_le() {
+        Ok(v) => v.unsigned_abs() as usize,
+        Err(_) => 0,
+    }
 }
 
 pub fn read_cell(data: &[u8], offset: u64) -> ForensicResult<HiveCell> {
     if data.len() < 6 {
-        return Err(ForensicError::bad_format_str("Invalid Cell: too small"))
+        return Err(ForensicError::registry_cell_error("cell", "too small"));
     }
-    let cell_len_i = i32::from_ne_bytes(data[..4].try_into().unwrap_or_default());
-    let cell_len = cell_len_i.unsigned_abs() as usize;
+    let mut reader = ByteReader::new(data);
+    let cell_len_i = reader.read_i32_le()?;
     if cell_len_i >= 0 {
         return Ok(HiveCell::Unallocated(UnallocatedCell { offset }));
     }
-    let signature = &data[4..6];
-    if cell_len > data.len() {
-        return Err(ForensicError::bad_format_str("Not enough buffer size"))
+    let cell_len = cell_len_i.unsigned_abs() as usize;
+    // A declared length whose magnitude is smaller than the 4-byte length prefix itself is
+    // corrupt/adversarial input: without this check, slicing `data[4..cell_len]` below would
+    // panic (start index > end index) instead of returning an `Err`.
+    if cell_len < 4 {
+        return Err(ForensicError::registry_cell_error(
+            "cell",
+            "declared length smaller than the length prefix",
+        ));
     }
-    let data = &data[4..cell_len];
+    let signature = reader.read_bytes(2)?;
+    if cell_len > data.len() {
+        return Err(ForensicError::registry_cell_error("cell", "not enough buffer size"));
+    }
+    let cell_data = &data[4..cell_len];
     let cell = if signature == INDEX_LEAF_SIGNATURE {
-        let cell = read_index_leaf_cell(data, offset)?;
-        HiveCell::IndexLeaf(cell)
+        HiveCell::IndexLeaf(read_index_leaf_cell(cell_data, offset)?)
     } else if signature == FAST_LEAF_SIGNATURE {
-        let cell = read_fast_leaf_cell(data, offset)?;
-        HiveCell::FastLeaf(cell)
+        HiveCell::FastLeaf(read_fast_leaf_cell(cell_data, offset)?)
     } else if signature == HASH_LEAF_SIGNATURE {
-        let cell = read_hash_leaf_cell(data, offset)?;
-        HiveCell::HashLeaf(cell)
+        HiveCell::HashLeaf(read_hash_leaf_cell(cell_data, offset)?)
     } else if signature == INDEX_ROOT_SIGNATURE {
-        let cell = read_index_root_cell(data, offset)?;
-        HiveCell::IndexRoot(cell)
+        HiveCell::IndexRoot(read_index_root_cell(cell_data, offset)?)
     } else if signature == KEY_NODE_SIGNATURE {
-        let cell = read_key_node_cell(data, offset)?;
-        HiveCell::KeyNode(cell)
+        HiveCell::KeyNode(read_key_node_cell(cell_data, offset)?)
     } else if signature == KEY_SECURITY_SIGNATURE {
-        let cell = read_key_security_cell(data, offset)?;
-        HiveCell::KeySecurity(cell)
+        HiveCell::KeySecurity(read_key_security_cell(cell_data, offset)?)
     } else if signature == KEY_VALUE_SIGNATURE {
-        let cell = read_key_value_cell(data, offset)?;
-        HiveCell::KeyValue(cell)
+        HiveCell::KeyValue(read_key_value_cell(cell_data, offset)?)
     } else {
         HiveCell::Invalid(InvalidCell {
             offset,
-            content: data[..].to_vec(),
+            content: cell_data.to_vec(),
         })
     };
     Ok(cell)
 }
 
 pub fn read_index_leaf_cell(data: &[u8], offset: u64) -> ForensicResult<IndexLeafCell> {
-    if data.len() < 4 {
-        return Err(ForensicError::bad_format_str("Invalid IndexLeafCell: too small"))
-    }
-    let signature = &data[0..2];
-    if signature != INDEX_LEAF_SIGNATURE {
-        return Err(ForensicError::bad_format_str("Invalid IndexLeafCell: invalid signature"));
-    }
-    let n_elements = u16::from_ne_bytes(data[2..4].try_into().unwrap_or_default());
-    let total_size_elements = (n_elements as usize) * 4 + 4;
-    if total_size_elements > data.len() {
-        return Err(ForensicError::bad_format_str("Invalid IndexLeafCell: size larger than buffer"));
-    }
-    let mut offset_list = Vec::with_capacity(n_elements.into());
-    for i in (4..(4 + 4 * n_elements as usize)).step_by(4) {
-        let offset = u32::from_ne_bytes(data[i..i + 4].try_into().unwrap_or_default());
-        offset_list.push(IndexLeafListElements { offset });
-    }
-    Ok(IndexLeafCell {
-        elements: offset_list,
-        offset,
-    })
+    let mut reader = ByteReader::new(data);
+    let mut cell: IndexLeafCell = reader.read_as()?;
+    cell.offset = offset;
+    Ok(cell)
 }
 
 pub fn read_fast_leaf_cell(data: &[u8], offset: u64) -> ForensicResult<FastLeafCell> {
-    if data.len() < 4 {
-        return Err(ForensicError::bad_format_str("Invalid FastLeafCell: too small"))
-    }
-    let signature = &data[0..2];
-    if signature != FAST_LEAF_SIGNATURE {
-        return Err(ForensicError::bad_format_str("Invalid FastLeafCell: invalid signature"));
-    }
-    let n_elements = u16::from_ne_bytes(data[2..4].try_into().unwrap_or_default());
-    let total_size_elements = (n_elements as usize) * 8 + 4;
-    if total_size_elements > data.len() {
-        return Err(ForensicError::bad_format_str("Invalid FastLeafCell: size larger than buffer"));
-    }
-    let mut offset_list = Vec::with_capacity(n_elements.into());
-    for i in (4..(4 + 8 * n_elements as usize)).step_by(8) {
-        let offset = u32::from_ne_bytes(data[i..i + 4].try_into().unwrap_or_default());
-        let data_end = match data[i + 4..i + 8].iter().position(|&v| v == 0) {
-            Some(v) => i + 4 + v,
-            None => i + 8,
-        };
-        let txt = String::from_utf8_lossy(&data[i + 4..data_end]).to_string();
-        offset_list.push(FastLeafListElements {
-            offset,
-            name_hint: txt,
-        });
-    }
-    Ok(FastLeafCell {
-        elements: offset_list,
-        offset,
-    })
+    let mut reader = ByteReader::new(data);
+    let mut cell: FastLeafCell = reader.read_as()?;
+    cell.offset = offset;
+    Ok(cell)
 }
 
 pub fn read_hash_leaf_cell(data: &[u8], offset: u64) -> ForensicResult<HashLeafCell> {
-    if data.len() < 4 {
-        return Err(ForensicError::bad_format_str("Invalid HashLeafCell: too small"))
-    }
-    let signature = &data[0..2];
-    if signature != HASH_LEAF_SIGNATURE {
-        return Err(ForensicError::bad_format_str("Invalid HashLeafCell: invalid signature"));
-    }
-    let n_elements = u16::from_ne_bytes(data[2..4].try_into().unwrap_or_default());
-    let total_size_elements = (n_elements as usize) * 8 + 4;
-    if total_size_elements > data.len() {
-        return Err(ForensicError::bad_format_str("Invalid HashLeafCell: size larger than buffer"));
-    }
-    let mut offset_list = Vec::with_capacity(n_elements.into());
-    for i in (4..total_size_elements).step_by(8) {
-        let offset = u32::from_ne_bytes(data[i..i + 4].try_into().unwrap_or_default());
-        let name_hash = u32::from_ne_bytes(data[i + 4..i + 8].try_into().unwrap_or_default());
-        offset_list.push(HashLeafListElements { offset, name_hash });
-    }
-    Ok(HashLeafCell {
-        elements: offset_list,
-        offset,
-    })
+    let mut reader = ByteReader::new(data);
+    let mut cell: HashLeafCell = reader.read_as()?;
+    cell.offset = offset;
+    Ok(cell)
 }
 
 pub fn read_index_root_cell(data: &[u8], offset: u64) -> ForensicResult<IndexRootCell> {
-    if data.len() < 4 {
-        return Err(ForensicError::bad_format_str("Invalid IndexRootCell: too small"))
-    }
-    let signature = &data[0..2];
-    if signature != INDEX_ROOT_SIGNATURE {
-        return Err(ForensicError::bad_format_str("Invalid IndexRootCell: invalid signature"));
-    }
-    let n_elements = u16::from_ne_bytes(data[2..4].try_into().unwrap_or_default());
-    let total_size_elements = (n_elements as usize) * 4 + 4;
-    if total_size_elements > data.len() {
-        return Err(ForensicError::bad_format_str("Invalid IndexRootCell: size larger than buffer"));
-    }
-    let mut offset_list = Vec::with_capacity(n_elements.into());
-    for i in (4..(4 + 4 * n_elements as usize)).step_by(4) {
-        let offset = u32::from_ne_bytes(data[i..i + 4].try_into().unwrap_or_default());
-        offset_list.push(IndexRootSubkeyOffset {
-            subkeys_list_offset: offset,
-        });
-    }
-    Ok(IndexRootCell {
-        elements: offset_list,
-        offset,
-    })
+    let mut reader = ByteReader::new(data);
+    let mut cell: IndexRootCell = reader.read_as()?;
+    cell.offset = offset;
+    Ok(cell)
 }
 
 pub fn read_key_node_cell(data: &[u8], offset: u64) -> ForensicResult<KeyNodeCell> {
-    if data.len() < 76 {
-        return Err(ForensicError::bad_format_str("Invalid KeyNode: too small"))
-    }
-    let signature = &data[0..2];
-    if signature != KEY_NODE_SIGNATURE {
-        return Err(ForensicError::bad_format_str("Invalid KeyNode: invalid signature"));
-    }
-    let (head, body, tail) = unsafe { data[0..76].align_to::<KeyNodeCellPacked>() };
-    if !head.is_empty() && !tail.is_empty() {
-        return Err(ForensicError::bad_format_str("Invalid KeyNode: structure not aligned"));
-    }
-    let packed_cell = &body[0];
-    let mut cell: KeyNodeCell = packed_cell.into();
+    let mut reader = ByteReader::new(data);
+    let mut cell: KeyNodeCell = reader.read_as()?;
     cell.offset = offset;
-    if 76 + cell.key_name_length as usize > data.len() {
-        return Err(ForensicError::bad_format_str("Invalid KeyNodeCell: size larger than buffer"));
-    }
-    cell.key_name = if cell.flags & KEY_COMP_NAME_FLAG == 0 {
-        let mut arr = Vec::with_capacity(cell.key_name_length as usize);
-        for i in (76..76 + (cell.key_name_length as usize)).step_by(2) {
-            arr.push(u16::from_ne_bytes([data[i], data[i + 1]]));
-        }
-        String::from_utf16_lossy(&arr).to_string()
-    } else {
-        String::from_utf8_lossy(&data[76..76 + (cell.key_name_length as usize)]).to_string()
-    };
     Ok(cell)
 }
 
 pub fn read_key_security_cell(data: &[u8], offset: u64) -> ForensicResult<KeySecurityCell> {
-    if data.len() < 76 {
-        return Err(ForensicError::bad_format_str("Invalid KeySecurityCell: too small"))
-    }
-    let signature = &data[0..2];
-    if signature != KEY_SECURITY_SIGNATURE {
-        return Err(ForensicError::bad_format_str("Invalid KeySecurityCell: invalid signature"));
-    }
-    let (head, body, tail) = unsafe { data[0..76].align_to::<KeySecurityCellPacked>() };
-    if !head.is_empty() || !tail.is_empty() {
-        return Err(ForensicError::bad_format_str("Invalid KeySecurityCell: structure not aligned"));
-    }
-    let packed_cell = &body[0];
-    let mut cell: KeySecurityCell = packed_cell.into();
+    let mut reader = ByteReader::new(data);
+    let mut cell: KeySecurityCell = reader.read_as()?;
     cell.offset = offset;
-    let sec_end_pos = 20 + cell.sec_desc_size as usize;
-    if sec_end_pos > data.len() {
-        return Err(ForensicError::bad_format_str("Invalid KeySecurityCell: size larger than buffer"));
-    }
-    for i in 20..sec_end_pos {
-        cell.sec_desc.push(data[i]);
-    }
     Ok(cell)
 }
 
 pub fn read_key_value_cell(data: &[u8], offset: u64) -> ForensicResult<KeyValueCell> {
-    if data.len() < 20 {
-        return Err(ForensicError::bad_format_str("Invalid KeyValueCell: too small"))
-    }
-    let signature = &data[0..2];
-    if signature != KEY_VALUE_SIGNATURE {
-        return Err(ForensicError::bad_format_str("Invalid KeyValueCell: invalid signature"));
-    }
-    let (head, body, tail) = unsafe { data[0..20].align_to::<KeyValueCellPacked>() };
-    if !head.is_empty() || !tail.is_empty() {
-        return Err(ForensicError::bad_format_str("Invalid KeyValueCell: structure not aligned"));
-    }
-    let packed_cell = &body[0];
-    let mut cell: KeyValueCell = packed_cell.into();
+    let mut reader = ByteReader::new(data);
+    let mut cell: KeyValueCell = reader.read_as()?;
     cell.offset = offset;
-    let value_name_end = 20 + cell.name_length as usize;
-    if value_name_end > data.len() {
-        return Err(ForensicError::bad_format_str("Invalid KeyValueCell: size larger than buffer"));
-    }
-    if cell.name_length != 0 {
-        cell.value_name = if cell.flags & VALUE_COMP_NAME_FLAG == 0 {
-            let mut arr = Vec::with_capacity(cell.name_length as usize);
-            for i in (20..20 + (cell.name_length as usize)).step_by(2) {
-                arr.push(u16::from_ne_bytes([data[i], data[i + 1]]));
-            }
-            String::from_utf16_lossy(&arr).to_string()
-        } else {
-            String::from_utf8_lossy(&data[20..20 + (cell.name_length as usize)]).to_string()
-        };
-    }
     Ok(cell)
-}
-
-impl From<KeyNodeCellPacked> for KeyNodeCell {
-    fn from(v: KeyNodeCellPacked) -> Self {
-        KeyNodeCell {
-            flags: v.flags,
-            last_written_timestamp: v.last_written_timestamp,
-            access_bits: v.access_bits,
-            parent: v.parent,
-            number_subkeys: v.number_subkeys,
-            number_volatile_subkeys: v.number_volatile_subkeys,
-            subkeys_list_offset: v.subkeys_list_offset,
-            volatile_subkeys_list_offset: v.volatile_subkeys_list_offset,
-            number_key_values: v.number_key_values,
-            key_values_list_offset: v.key_values_list_offset,
-            key_security_offset: v.key_security_offset,
-            class_name_offset: v.class_name_offset,
-            largest_subkey_class_name_length: v.largest_subkey_class_name_length,
-            largest_subkey_name_length: v.largest_subkey_name_length,
-            debug: v.debug,
-            virt_and_user_flags: v.virt_and_user_flags,
-            largest_value_name_length: v.largest_value_name_length,
-            largest_value_data_size: v.largest_value_data_size,
-            work_var: v.work_var,
-            key_name_length: v.key_name_length,
-            class_name_length: v.class_name_length,
-            key_name: String::new(),
-            offset: 0,
-        }
-    }
-}
-impl From<&KeyNodeCellPacked> for KeyNodeCell {
-    fn from(v: &KeyNodeCellPacked) -> Self {
-        KeyNodeCell {
-            flags: v.flags,
-            last_written_timestamp: v.last_written_timestamp,
-            access_bits: v.access_bits,
-            parent: v.parent,
-            number_subkeys: v.number_subkeys,
-            number_volatile_subkeys: v.number_volatile_subkeys,
-            subkeys_list_offset: v.subkeys_list_offset,
-            volatile_subkeys_list_offset: v.volatile_subkeys_list_offset,
-            number_key_values: v.number_key_values,
-            key_values_list_offset: v.key_values_list_offset,
-            key_security_offset: v.key_security_offset,
-            class_name_offset: v.class_name_offset,
-            largest_subkey_class_name_length: v.largest_subkey_class_name_length,
-            largest_subkey_name_length: v.largest_subkey_name_length,
-            debug: v.debug,
-            virt_and_user_flags: v.virt_and_user_flags,
-            largest_value_name_length: v.largest_value_name_length,
-            largest_value_data_size: v.largest_value_data_size,
-            work_var: v.work_var,
-            key_name_length: v.key_name_length,
-            class_name_length: v.class_name_length,
-            key_name: String::new(),
-            offset: 0,
-        }
-    }
-}
-
-impl From<KeySecurityCellPacked> for KeySecurityCell {
-    fn from(v: KeySecurityCellPacked) -> Self {
-        KeySecurityCell {
-            blink: v.blink,
-            flink: v.flink,
-            ref_count: v.ref_count,
-            sec_desc: Vec::with_capacity(v.sec_desc_size as usize),
-            sec_desc_size: v.sec_desc_size,
-            offset: 0,
-        }
-    }
-}
-impl From<&KeySecurityCellPacked> for KeySecurityCell {
-    fn from(v: &KeySecurityCellPacked) -> Self {
-        KeySecurityCell {
-            blink: v.blink,
-            flink: v.flink,
-            ref_count: v.ref_count,
-            sec_desc: Vec::with_capacity(v.sec_desc_size as usize),
-            sec_desc_size: v.sec_desc_size,
-            offset: 0,
-        }
-    }
-}
-impl From<KeyValueCellPacked> for KeyValueCell {
-    fn from(v: KeyValueCellPacked) -> Self {
-        Self {
-            name_length: v.name_length,
-            data_size: v.data_size,
-            data_offset: v.data_offset,
-            data_type: v.data_type,
-            flags: v.flags,
-            value_name: String::new(),
-            offset: 0,
-        }
-    }
-}
-impl From<&KeyValueCellPacked> for KeyValueCell {
-    fn from(v: &KeyValueCellPacked) -> Self {
-        Self {
-            name_length: v.name_length,
-            data_size: v.data_size,
-            data_offset: v.data_offset,
-            data_type: v.data_type,
-            flags: v.flags,
-            value_name: String::new(),
-            offset: 0,
-        }
-    }
 }
 
 impl InvalidCell {
     pub fn into_reg_sz_extended(&self) -> String {
-        let s: &[u16] = unsafe {
-            std::slice::from_raw_parts(self.content.as_ptr() as *const _, self.content.len() / 2)
-        };
+        let s: Vec<u16> = self
+            .content
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect();
         let first_zero = match s.iter().rev().position(|&v| v == 0) {
             Some(v) => s.len() - v,
             None => s.len(),
         };
         let last_zero = match s[0..first_zero].iter().rev().position(|&v| v != 0) {
             Some(v) => first_zero - v,
-            None => s.len(),
+            // Every element up to `first_zero` is a null: there is no content to keep.
+            None => 0,
         };
         String::from_utf16_lossy(&s[..last_zero])
     }
@@ -667,7 +560,8 @@ impl InvalidCell {
             .position(|&v| v != 0)
         {
             Some(v) => first_zero - v,
-            None => self.content.len(),
+            // Every element up to `first_zero` is a null: there is no content to keep.
+            None => 0,
         };
         let ret = String::from_utf8_lossy(&self.content[..last_zero]).to_string();
         ret
@@ -700,12 +594,399 @@ impl InvalidCell {
 
 #[cfg(test)]
 mod tst {
-    use crate::cell::HashLeafCell;
+    use super::*;
 
     #[test]
     fn should_hash_sam_name() {
         assert_eq!(116109, HashLeafCell::hash_name("SAM"));
         assert_eq!(116109, HashLeafCell::hash_name("sam"));
         assert_eq!(116109, HashLeafCell::hash_name("SaM"));
+    }
+
+    // --- test helpers --------------------------------------------------------------------
+
+    /// Builds a full REGF cell buffer (4-byte size prefix + `content`, where `content` starts
+    /// with the 2-byte signature) the way it appears inside a hive bin, for feeding into
+    /// `read_cell`/`peek_cell`.
+    fn wrap_cell(content: &[u8]) -> Vec<u8> {
+        let total_len = 4 + content.len();
+        let mut buf = Vec::with_capacity(total_len);
+        buf.extend_from_slice(&(-(total_len as i32)).to_le_bytes());
+        buf.extend_from_slice(content);
+        buf
+    }
+
+    /// Builds a full 76-byte `KeyNodeCell` header (all-zero except signature/flags/name
+    /// length) followed by the encoded key name, matching what `read_key_node_cell` expects.
+    fn build_key_node_bytes(key_name: &str, ascii_name: bool) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(KEY_NODE_SIGNATURE);
+        let flags: u16 = if ascii_name { KEY_COMP_NAME_FLAG } else { 0 };
+        buf.extend_from_slice(&flags.to_le_bytes()); // flags
+        buf.extend_from_slice(&0u64.to_le_bytes()); // last_written_timestamp
+        buf.extend_from_slice(&0u32.to_le_bytes()); // access_bits
+        buf.extend_from_slice(&0u32.to_le_bytes()); // parent
+        buf.extend_from_slice(&0u32.to_le_bytes()); // number_subkeys
+        buf.extend_from_slice(&0u32.to_le_bytes()); // number_volatile_subkeys
+        buf.extend_from_slice(&0u32.to_le_bytes()); // subkeys_list_offset
+        buf.extend_from_slice(&0u32.to_le_bytes()); // volatile_subkeys_list_offset
+        buf.extend_from_slice(&0u32.to_le_bytes()); // number_key_values
+        buf.extend_from_slice(&0u32.to_le_bytes()); // key_values_list_offset
+        buf.extend_from_slice(&0u32.to_le_bytes()); // key_security_offset
+        buf.extend_from_slice(&0u32.to_le_bytes()); // class_name_offset
+        buf.extend_from_slice(&0u32.to_le_bytes()); // largest_subkey_class_name_length
+        buf.extend_from_slice(&0u16.to_le_bytes()); // largest_subkey_name_length
+        buf.push(0); // virt_and_user_flags
+        buf.push(0); // debug
+        buf.extend_from_slice(&0u32.to_le_bytes()); // largest_value_name_length
+        buf.extend_from_slice(&0u32.to_le_bytes()); // largest_value_data_size
+        buf.extend_from_slice(&0u32.to_le_bytes()); // work_var
+        let name_bytes: Vec<u8> = if ascii_name {
+            key_name.as_bytes().to_vec()
+        } else {
+            key_name
+                .encode_utf16()
+                .flat_map(|c| c.to_le_bytes())
+                .collect()
+        };
+        buf.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes()); // key_name_length
+        buf.extend_from_slice(&0u16.to_le_bytes()); // class_name_length
+        buf.extend_from_slice(&name_bytes);
+        assert_eq!(76, buf.len() - name_bytes.len());
+        buf
+    }
+
+    /// Builds a full 20-byte `KeyValueCell` header followed by the value name.
+    fn build_key_value_bytes(value_name: &str, ascii_name: bool) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(KEY_VALUE_SIGNATURE);
+        let name_bytes: Vec<u8> = if ascii_name {
+            value_name.as_bytes().to_vec()
+        } else {
+            value_name
+                .encode_utf16()
+                .flat_map(|c| c.to_le_bytes())
+                .collect()
+        };
+        buf.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes()); // name_length
+        buf.extend_from_slice(&4u32.to_le_bytes()); // data_size
+        buf.extend_from_slice(&0x1000u32.to_le_bytes()); // data_offset
+        buf.extend_from_slice(&DATA_TYPE_REG_DWORD_TEST.to_le_bytes()); // data_type
+        let flags: u16 = if ascii_name { VALUE_COMP_NAME_FLAG } else { 0 };
+        buf.extend_from_slice(&flags.to_le_bytes()); // flags
+        buf.extend_from_slice(&0u16.to_le_bytes()); // spare
+        assert_eq!(20, buf.len());
+        buf.extend_from_slice(&name_bytes);
+        buf
+    }
+    const DATA_TYPE_REG_DWORD_TEST: u32 = 4;
+
+    /// Builds a full 20-byte `KeySecurityCell` header followed by `sec_desc`.
+    fn build_key_security_bytes(sec_desc: &[u8]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(KEY_SECURITY_SIGNATURE);
+        buf.extend_from_slice(&0u16.to_le_bytes()); // reserved
+        buf.extend_from_slice(&0u32.to_le_bytes()); // flink
+        buf.extend_from_slice(&0u32.to_le_bytes()); // blink
+        buf.extend_from_slice(&0u32.to_le_bytes()); // ref_count
+        buf.extend_from_slice(&(sec_desc.len() as u32).to_le_bytes()); // sec_desc_size
+        assert_eq!(20, buf.len());
+        buf.extend_from_slice(sec_desc);
+        buf
+    }
+
+    fn invalid_cell(content: &[u8]) -> InvalidCell {
+        InvalidCell {
+            offset: 0,
+            content: content.to_vec(),
+        }
+    }
+
+    // --- read_key_node_cell ----------------------------------------------------------------
+
+    #[test]
+    fn read_key_node_cell_rejects_too_small_buffer() {
+        assert!(read_key_node_cell(&[0u8; 10], 0).is_err());
+    }
+
+    #[test]
+    fn read_key_node_cell_rejects_wrong_signature() {
+        let mut buf = build_key_node_bytes("Foo", true);
+        buf[0] = b'x';
+        assert!(read_key_node_cell(&buf, 0).is_err());
+    }
+
+    #[test]
+    fn read_key_node_cell_rejects_name_length_overflowing_buffer() {
+        let mut buf = build_key_node_bytes("Foo", true);
+        buf.truncate(76); // drop the actual name bytes but keep key_name_length=3
+        assert!(read_key_node_cell(&buf, 0).is_err());
+    }
+
+    #[test]
+    fn read_key_node_cell_decodes_ascii_compressed_name() {
+        let buf = build_key_node_bytes("SAM", true);
+        let cell = read_key_node_cell(&buf, 42).unwrap();
+        assert_eq!("SAM", cell.key_name);
+        assert_eq!(42, cell.offset);
+        assert_eq!(KEY_COMP_NAME_FLAG, cell.flags);
+    }
+
+    #[test]
+    fn read_key_node_cell_decodes_utf16_name() {
+        let buf = build_key_node_bytes("Ñandú", false);
+        let cell = read_key_node_cell(&buf, 7).unwrap();
+        assert_eq!("Ñandú", cell.key_name);
+        assert_eq!(7, cell.offset);
+    }
+
+    // --- read_key_value_cell ---------------------------------------------------------------
+
+    #[test]
+    fn read_key_value_cell_rejects_too_small_buffer() {
+        assert!(read_key_value_cell(&[0u8; 5], 0).is_err());
+    }
+
+    #[test]
+    fn read_key_value_cell_rejects_wrong_signature() {
+        let mut buf = build_key_value_bytes("Foo", true);
+        buf[0] = b'x';
+        assert!(read_key_value_cell(&buf, 0).is_err());
+    }
+
+    #[test]
+    fn read_key_value_cell_rejects_name_length_overflowing_buffer() {
+        let mut buf = build_key_value_bytes("Foo", true);
+        buf.truncate(20);
+        assert!(read_key_value_cell(&buf, 0).is_err());
+    }
+
+    #[test]
+    fn read_key_value_cell_decodes_ascii_compressed_name() {
+        let buf = build_key_value_bytes("Version", true);
+        let cell = read_key_value_cell(&buf, 3).unwrap();
+        assert_eq!("Version", cell.value_name);
+        assert_eq!(3, cell.offset);
+        assert_eq!(4, cell.data_size);
+        assert_eq!(0x1000, cell.data_offset);
+    }
+
+    #[test]
+    fn read_key_value_cell_decodes_utf16_name() {
+        let buf = build_key_value_bytes("Versión", false);
+        let cell = read_key_value_cell(&buf, 3).unwrap();
+        assert_eq!("Versión", cell.value_name);
+    }
+
+    // --- read_key_security_cell -------------------------------------------------------------
+
+    #[test]
+    fn read_key_security_cell_rejects_too_small_buffer() {
+        assert!(read_key_security_cell(&[0u8; 5], 0).is_err());
+    }
+
+    #[test]
+    fn read_key_security_cell_rejects_wrong_signature() {
+        let mut buf = build_key_security_bytes(&[1, 2, 3]);
+        buf[0] = b'x';
+        assert!(read_key_security_cell(&buf, 0).is_err());
+    }
+
+    #[test]
+    fn read_key_security_cell_rejects_sec_desc_size_overflowing_buffer() {
+        let mut buf = build_key_security_bytes(&[1, 2, 3]);
+        buf.truncate(20); // header claims 3 bytes of sec_desc but none are present
+        assert!(read_key_security_cell(&buf, 0).is_err());
+    }
+
+    #[test]
+    fn read_key_security_cell_decodes_sec_desc() {
+        let buf = build_key_security_bytes(&[0xAA, 0xBB, 0xCC]);
+        let cell = read_key_security_cell(&buf, 9).unwrap();
+        assert_eq!(vec![0xAA, 0xBB, 0xCC], cell.sec_desc);
+        assert_eq!(9, cell.offset);
+    }
+
+    // --- read_cell dispatch -----------------------------------------------------------------
+
+    #[test]
+    fn read_cell_rejects_too_small_buffer() {
+        assert!(read_cell(&[0u8; 4], 0).is_err());
+    }
+
+    #[test]
+    fn read_cell_treats_positive_length_as_unallocated() {
+        let mut buf = 8i32.to_le_bytes().to_vec();
+        buf.extend_from_slice(&[0, 0]);
+        match read_cell(&buf, 5).unwrap() {
+            HiveCell::Unallocated(v) => assert_eq!(5, v.offset),
+            other => panic!("expected Unallocated, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn read_cell_rejects_oversized_declared_length() {
+        let mut buf = (-1000i32).to_le_bytes().to_vec();
+        buf.extend_from_slice(b"nk");
+        assert!(read_cell(&buf, 0).is_err());
+    }
+
+    #[test]
+    fn read_cell_rejects_declared_length_smaller_than_prefix_without_panicking() {
+        // A declared cell length of 1..3 bytes (absolute value) is smaller than the 4-byte
+        // length prefix that encodes it — corrupt/adversarial input. Before this guard existed,
+        // `read_cell` sliced `data[4..cell_len]` unconditionally and panicked here instead of
+        // returning an error.
+        for bad_len in [-1i32, -2, -3] {
+            let mut buf = bad_len.to_le_bytes().to_vec();
+            buf.extend_from_slice(b"nk");
+            assert!(read_cell(&buf, 0).is_err(), "declared length {bad_len} should error, not panic");
+        }
+    }
+
+    #[test]
+    fn read_cell_wraps_unknown_signature_as_invalid() {
+        let content = vec![0xFF, 0xFE, 0x01, 0x02, 0x03, 0x04];
+        let buf = wrap_cell(&content);
+        match read_cell(&buf, 0).unwrap() {
+            HiveCell::Invalid(v) => assert_eq!(content, v.content),
+            other => panic!("expected Invalid, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn read_cell_dispatches_index_leaf() {
+        let buf = wrap_cell(&[b'l', b'i', 0, 0]);
+        assert!(matches!(read_cell(&buf, 0).unwrap(), HiveCell::IndexLeaf(_)));
+    }
+
+    #[test]
+    fn read_cell_dispatches_fast_leaf() {
+        let buf = wrap_cell(&[b'l', b'f', 0, 0]);
+        assert!(matches!(read_cell(&buf, 0).unwrap(), HiveCell::FastLeaf(_)));
+    }
+
+    #[test]
+    fn read_cell_dispatches_hash_leaf() {
+        let buf = wrap_cell(&[b'l', b'h', 0, 0]);
+        assert!(matches!(read_cell(&buf, 0).unwrap(), HiveCell::HashLeaf(_)));
+    }
+
+    #[test]
+    fn read_cell_dispatches_index_root() {
+        let buf = wrap_cell(&[b'r', b'i', 0, 0]);
+        assert!(matches!(read_cell(&buf, 0).unwrap(), HiveCell::IndexRoot(_)));
+    }
+
+    #[test]
+    fn read_cell_dispatches_key_node() {
+        let buf = wrap_cell(&build_key_node_bytes("", true));
+        assert!(matches!(read_cell(&buf, 0).unwrap(), HiveCell::KeyNode(_)));
+    }
+
+    #[test]
+    fn read_cell_dispatches_key_value() {
+        let buf = wrap_cell(&build_key_value_bytes("", true));
+        assert!(matches!(read_cell(&buf, 0).unwrap(), HiveCell::KeyValue(_)));
+    }
+
+    #[test]
+    fn read_cell_dispatches_key_security() {
+        let buf = wrap_cell(&build_key_security_bytes(&[]));
+        assert!(matches!(read_cell(&buf, 0).unwrap(), HiveCell::KeySecurity(_)));
+    }
+
+    // --- peek_cell --------------------------------------------------------------------------
+
+    #[test]
+    fn peek_cell_returns_zero_for_too_small_buffer() {
+        assert_eq!(0, peek_cell(&[1, 2, 3]));
+    }
+
+    #[test]
+    fn peek_cell_returns_absolute_value_of_negative_length() {
+        assert_eq!(16, peek_cell(&(-16i32).to_le_bytes()));
+    }
+
+    // --- InvalidCell conversion helpers ------------------------------------------------------
+
+    #[test]
+    fn into_reg_sz_ascii_stops_at_first_null_terminator() {
+        let cell = invalid_cell(b"Hello\0\0\0");
+        assert_eq!("Hello", cell.into_reg_sz_ascii());
+    }
+
+    #[test]
+    fn into_reg_sz_ascii_handles_empty_and_all_zero_content() {
+        assert_eq!("", invalid_cell(&[]).into_reg_sz_ascii());
+        assert_eq!("", invalid_cell(&[0, 0, 0]).into_reg_sz_ascii());
+    }
+
+    #[test]
+    fn into_reg_sz_ascii_uses_full_length_when_no_terminator() {
+        let cell = invalid_cell(b"NoTerminator");
+        assert_eq!("NoTerminator", cell.into_reg_sz_ascii());
+    }
+
+    fn utf16_bytes_with_nulls(s: &str, trailing_nulls: usize) -> Vec<u8> {
+        let mut v: Vec<u8> = s.encode_utf16().flat_map(|c| c.to_le_bytes()).collect();
+        for _ in 0..trailing_nulls {
+            v.extend_from_slice(&0u16.to_le_bytes());
+        }
+        v
+    }
+
+    #[test]
+    fn into_reg_sz_extended_decodes_even_length_utf16() {
+        let cell = invalid_cell(&utf16_bytes_with_nulls("Hello", 1));
+        assert_eq!("Hello", cell.into_reg_sz_extended());
+    }
+
+    #[test]
+    fn into_reg_sz_extended_drops_trailing_odd_byte_without_panicking() {
+        let mut content = utf16_bytes_with_nulls("Hi", 1);
+        content.push(0xAA); // stray trailing byte, not a full u16
+        let cell = invalid_cell(&content);
+        assert_eq!("Hi", cell.into_reg_sz_extended());
+    }
+
+    #[test]
+    fn into_reg_sz_extended_handles_empty_and_all_zero_content() {
+        assert_eq!("", invalid_cell(&[]).into_reg_sz_extended());
+        assert_eq!("", invalid_cell(&[0, 0, 0, 0]).into_reg_sz_extended());
+    }
+
+    #[test]
+    fn into_reg_sz_extended_handles_multiple_trailing_nulls() {
+        let cell = invalid_cell(&utf16_bytes_with_nulls("Hi", 3));
+        assert_eq!("Hi", cell.into_reg_sz_extended());
+    }
+
+    #[test]
+    fn into_dword_variants_decode_correct_length_content() {
+        assert_eq!(0x04030201, invalid_cell(&[0x01, 0x02, 0x03, 0x04]).into_dword_le());
+        assert_eq!(0x01020304, invalid_cell(&[0x01, 0x02, 0x03, 0x04]).into_dword_be());
+    }
+
+    #[test]
+    fn into_dword_variants_return_zero_for_wrong_length() {
+        assert_eq!(0, invalid_cell(&[]).into_dword());
+        assert_eq!(0, invalid_cell(&[1, 2, 3]).into_dword());
+        assert_eq!(0, invalid_cell(&[1, 2, 3, 4, 5]).into_dword());
+        assert_eq!(0, invalid_cell(&[1, 2, 3]).into_dword_le());
+        assert_eq!(0, invalid_cell(&[1, 2, 3]).into_dword_be());
+    }
+
+    #[test]
+    fn into_qword_le_decodes_correct_length_content() {
+        let cell = invalid_cell(&[1, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(1, cell.into_qword_le());
+    }
+
+    #[test]
+    fn into_qword_le_returns_zero_for_wrong_length() {
+        assert_eq!(0, invalid_cell(&[]).into_qword_le());
+        assert_eq!(0, invalid_cell(&[1, 2, 3, 4, 5, 6, 7]).into_qword_le());
+        assert_eq!(0, invalid_cell(&[1, 2, 3, 4, 5, 6, 7, 8, 9]).into_qword_le());
     }
 }
