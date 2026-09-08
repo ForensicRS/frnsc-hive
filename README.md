@@ -8,10 +8,23 @@ Open Hive registry for forensic purpouses. Uses [ForensicRs](https://github.com/
 ## Status
 Production ready with certain conditions:
 * Implements the `Registry`/`RegistryExt` traits (forensic-rs 0.14+), but the way `HiveRegistryReader` is initialized may change in the future.
-* Mounted keys/values can't interact with hives at the moment.
-* LOG files are not currently implemented.
+* Mounted keys/values can be navigated (opened, enumerated) like real hive keys, including when mounted underneath an already-loaded real hive. Chaining multiple `.open()` calls into a mounted grandchild of an already-open *non-root* real key that wasn't itself reached by name is not covered; real/mounted children interleaved at every level of one multi-segment path aren't either — see [HiveFiles::open_key_from_offset](src/reader.rs) for details.
+* Transaction log replay (`.LOG1`/`.LOG2`, new format, Windows 8.1+) is implemented for SYSTEM/SOFTWARE/SECURITY/SAM and per-user `NTUSER.DAT` hives opened via `HiveRegistryReader::from_fs`/`HiveFormatFactory` — a dirty hive (`prim_sequence != sec_sequence` in its base block) has its pending log entries replayed in memory before being parsed, so reads reflect the recovered state rather than the stale on-disk bytes. If no log entry covers the dirty gap, the hive still opens using its original (uncorrected) bytes, with a warning logged and an `IntegrityIssue` finding recorded — recovery never blocks opening a hive. The pre-Windows-8.1 old-format `.LOG` (single file, bitmap-based) is not supported, and hives loaded via `HiveRegistryReader::add_other` (arbitrary mounted `.hve` files) don't go through log discovery/replay at all.
+* Analyst-relevant integrity signals (checksum mismatches, unreplayed dirty hives, skipped/malformed log entries, unparseable hives) are recorded as `forensic_rs::pipeline::finding::Finding`s, retrievable via `HiveRegistryReader::findings`, in addition to the `warn!`-level log lines meant for engineers.
+* `factory::HiveFormatFactory` implements `forensic_rs::traits::format::FormatFactory`, so this crate can plug into `forensic_rs::core::resolver::MountResolver` and mount a single hive file (found through its `probe`/`mount` contract) as `Mounted::Registry`, in addition to the crate-specific `HiveRegistryReader::from_fs`/`add_other` entry points.
+* `HiveRegistryReader` implements `RecoverDeleted` (reachable via `Registry::as_recovery`), carving deleted keys/values out of unallocated hive cells with strict plausibility validation to guard against false positives — see [src/recovery.rs](src/recovery.rs)'s module doc for exactly what's checked and its known limitations (a recovered value's owning key generally can't be identified, and a recovered key's parent is only named when it's still live).
 
 https://github.com/msuhanov/regf/blob/master/Windows%20registry%20file%20format%20specification.md
+
+## Examples
+
+Runnable versions of everything below (and more) live in [`examples/`](examples/) — run any of them with `cargo run --example <name>` from the crate root:
+
+* [`load_hives_from_fs`](examples/load_hives_from_fs.rs) — load the standard hive layout from a filesystem and read/enumerate keys.
+* [`mounted_registry_keys`](examples/mounted_registry_keys.rs) — build a purely in-memory registry by injecting keys/values, no hive file involved.
+* [`format_factory_mount`](examples/format_factory_mount.rs) — mount a hive file through the forensic-rs 0.14 `FormatFactory`/`MountResolver` sniff-and-mount contract.
+* [`integrity_findings`](examples/integrity_findings.rs) — surface a base-block checksum mismatch as a `Finding`, not just a log line.
+* [`carve_deleted_keys`](examples/carve_deleted_keys.rs) — recover a deleted registry key from unallocated hive cells via `RecoverDeleted`.
 
 ## Working with Hives
 
@@ -54,4 +67,34 @@ reader.add_reg_key(r"HKEY_LOCAL_MACHINE\HARDWARE\DESCRIPTION\System", r"Identifi
 let key = reader.key(r"HKLM\HARDWARE\DESCRIPTION\System").unwrap();
 assert_eq!(RegValue::SZ(r"AT/AT COMPATIBLE".into()), key.value("Identifier").unwrap());
 // `key` closes automatically when it goes out of scope
+```
+
+Mounted keys are fully navigable, not just readable as a single flat value — a parent mounted key can be opened and its subkeys enumerated:
+
+```rust
+use frnsc_hive::reader::HiveRegistryReader;
+use forensic_rs::prelude::{RegValue, RegistryExt};
+
+let mut reader = HiveRegistryReader::new();
+reader.add_reg_key(r"HKEY_LOCAL_MACHINE\HARDWARE\ACPI\DSDT", r"Signature", RegValue::SZ("DSDT".into()));
+reader.add_reg_key(r"HKEY_LOCAL_MACHINE\HARDWARE\ACPI\FADT", r"Signature", RegValue::SZ("FACP".into()));
+
+let acpi = reader.key(r"HKLM\HARDWARE\ACPI").unwrap();
+let subkeys: Vec<String> = acpi.keys().unwrap().into_iter().map(|k| k.name).collect();
+assert_eq!(vec!["DSDT", "FADT"], subkeys);
+```
+
+A mounted key can also be injected underneath an already-loaded real hive (e.g. a synthetic/volatile value under `HKLM\SOFTWARE`) — it shows up alongside the hive's real subkeys:
+
+```rust,ignore
+// Assuming `reader` already has the SOFTWARE hive loaded via `set_software`/`from_fs`:
+reader.add_reg_key(
+    r"HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Run\InjectedVolatileEntry",
+    r"ImagePath",
+    RegValue::SZ(r"C:\example.exe".into()),
+);
+let run_key = reader.key(r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Run").unwrap();
+// `InjectedVolatileEntry` appears alongside the real subkeys read from the SOFTWARE hive file.
+let names: Vec<String> = run_key.keys().unwrap().into_iter().map(|k| k.name).collect();
+assert!(names.contains(&"InjectedVolatileEntry".to_string()));
 ```

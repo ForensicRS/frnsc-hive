@@ -73,7 +73,13 @@ impl HiveCell {
 }
 #[derive(Debug, Clone)]
 pub struct UnallocatedCell {
-    pub offset: u64
+    pub offset: u64,
+    /// The cell's declared size in bytes (including the 4-byte length-prefix field itself), as
+    /// read directly from the positive length prefix — i.e. how many bytes past `offset`
+    /// (relative to the hive-bins-data start) this free span spans. Lets [crate::recovery] scan
+    /// exactly this span for leftover, still-negative-length-prefixed `nk`/`vk` cell bytes from a
+    /// deleted key/value that hasn't yet been overwritten.
+    pub size: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -135,7 +141,7 @@ impl HashLeafCell {
     }
 
     pub fn uppercase(v: u8) -> u32 {
-        if (b'a'..b'z').contains(&v) {
+        if v.is_ascii_lowercase() {
             (b'A' + (v - b'a')) as u32
         } else {
             v as u32
@@ -442,7 +448,10 @@ pub fn read_cell(data: &[u8], offset: u64) -> ForensicResult<HiveCell> {
     let mut reader = ByteReader::new(data);
     let cell_len_i = reader.read_i32_le()?;
     if cell_len_i >= 0 {
-        return Ok(HiveCell::Unallocated(UnallocatedCell { offset }));
+        return Ok(HiveCell::Unallocated(UnallocatedCell {
+            offset,
+            size: cell_len_i as u32,
+        }));
     }
     let cell_len = cell_len_i.unsigned_abs() as usize;
     // A declared length whose magnitude is smaller than the 4-byte length prefix itself is
@@ -554,41 +563,51 @@ impl InvalidCell {
             Some(v) => self.content.len() - v,
             None => self.content.len(),
         };
-        let last_zero = match self.content[0..first_zero]
-            .iter()
-            .rev()
-            .position(|&v| v != 0)
-        {
+        let last_zero = match self.content[0..first_zero].iter().rev().position(|&v| v != 0) {
             Some(v) => first_zero - v,
             // Every element up to `first_zero` is a null: there is no content to keep.
             None => 0,
         };
-        let ret = String::from_utf8_lossy(&self.content[..last_zero]).to_string();
-        ret
+        String::from_utf8_lossy(&self.content[..last_zero]).to_string()
     }
-    pub fn into_dword(&self) -> u32 {
-        if self.content.len() != 4 {
-            return 0;
-        }
-        u32::from_ne_bytes(self.content[0..4].try_into().unwrap_or_default())
+    /// Decodes this cell's content as a native-endian `DWORD`. Errors (rather than fabricating a
+    /// `0`) when the content isn't exactly 4 bytes — a truncated/corrupt resident value must be
+    /// surfaced as such, never silently decoded as a plausible-looking `DWORD:0`.
+    pub fn into_dword(&self) -> ForensicResult<u32> {
+        let bytes: [u8; 4] = self.content[..].try_into().map_err(|_| {
+            ForensicError::registry_cell_error(
+                "key_value_data",
+                format!("expected 4 bytes for a DWORD, got {}", self.content.len()),
+            )
+        })?;
+        Ok(u32::from_ne_bytes(bytes))
     }
-    pub fn into_dword_le(&self) -> u32 {
-        if self.content.len() != 4 {
-            return 0;
-        }
-        u32::from_le_bytes(self.content[0..4].try_into().unwrap_or_default())
+    pub fn into_dword_le(&self) -> ForensicResult<u32> {
+        let bytes: [u8; 4] = self.content[..].try_into().map_err(|_| {
+            ForensicError::registry_cell_error(
+                "key_value_data",
+                format!("expected 4 bytes for a DWORD, got {}", self.content.len()),
+            )
+        })?;
+        Ok(u32::from_le_bytes(bytes))
     }
-    pub fn into_dword_be(&self) -> u32 {
-        if self.content.len() != 4 {
-            return 0;
-        }
-        u32::from_be_bytes(self.content[0..4].try_into().unwrap_or_default())
+    pub fn into_dword_be(&self) -> ForensicResult<u32> {
+        let bytes: [u8; 4] = self.content[..].try_into().map_err(|_| {
+            ForensicError::registry_cell_error(
+                "key_value_data",
+                format!("expected 4 bytes for a DWORD, got {}", self.content.len()),
+            )
+        })?;
+        Ok(u32::from_be_bytes(bytes))
     }
-    pub fn into_qword_le(&self) -> u64 {
-        if self.content.len() != 8 {
-            return 0;
-        }
-        u64::from_le_bytes(self.content[0..8].try_into().unwrap_or_default())
+    pub fn into_qword_le(&self) -> ForensicResult<u64> {
+        let bytes: [u8; 8] = self.content[..].try_into().map_err(|_| {
+            ForensicError::registry_cell_error(
+                "key_value_data",
+                format!("expected 8 bytes for a QWORD, got {}", self.content.len()),
+            )
+        })?;
+        Ok(u64::from_le_bytes(bytes))
     }
 }
 
@@ -601,6 +620,16 @@ mod tst {
         assert_eq!(116109, HashLeafCell::hash_name("SAM"));
         assert_eq!(116109, HashLeafCell::hash_name("sam"));
         assert_eq!(116109, HashLeafCell::hash_name("SaM"));
+    }
+
+    /// Regression test: `uppercase` used to check membership in the exclusive range
+    /// `b'a'..b'z'`, which never matches `b'z'` (0x7A) — a name's case-insensitive hash would
+    /// differ depending on whether it ended in a lowercase or uppercase `Z`, breaking HashLeaf
+    /// lookups for any subkey name containing a lowercase `z`.
+    #[test]
+    fn uppercase_covers_lowercase_z() {
+        assert_eq!(b'Z' as u32, HashLeafCell::uppercase(b'z'));
+        assert_eq!(HashLeafCell::hash_name("BUZZ"), HashLeafCell::hash_name("buzz"));
     }
 
     // --- test helpers --------------------------------------------------------------------
@@ -644,10 +673,7 @@ mod tst {
         let name_bytes: Vec<u8> = if ascii_name {
             key_name.as_bytes().to_vec()
         } else {
-            key_name
-                .encode_utf16()
-                .flat_map(|c| c.to_le_bytes())
-                .collect()
+            key_name.encode_utf16().flat_map(|c| c.to_le_bytes()).collect()
         };
         buf.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes()); // key_name_length
         buf.extend_from_slice(&0u16.to_le_bytes()); // class_name_length
@@ -663,10 +689,7 @@ mod tst {
         let name_bytes: Vec<u8> = if ascii_name {
             value_name.as_bytes().to_vec()
         } else {
-            value_name
-                .encode_utf16()
-                .flat_map(|c| c.to_le_bytes())
-                .collect()
+            value_name.encode_utf16().flat_map(|c| c.to_le_bytes()).collect()
         };
         buf.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes()); // name_length
         buf.extend_from_slice(&4u32.to_le_bytes()); // data_size
@@ -840,7 +863,10 @@ mod tst {
         for bad_len in [-1i32, -2, -3] {
             let mut buf = bad_len.to_le_bytes().to_vec();
             buf.extend_from_slice(b"nk");
-            assert!(read_cell(&buf, 0).is_err(), "declared length {bad_len} should error, not panic");
+            assert!(
+                read_cell(&buf, 0).is_err(),
+                "declared length {bad_len} should error, not panic"
+            );
         }
     }
 
@@ -964,29 +990,38 @@ mod tst {
 
     #[test]
     fn into_dword_variants_decode_correct_length_content() {
-        assert_eq!(0x04030201, invalid_cell(&[0x01, 0x02, 0x03, 0x04]).into_dword_le());
-        assert_eq!(0x01020304, invalid_cell(&[0x01, 0x02, 0x03, 0x04]).into_dword_be());
+        assert_eq!(
+            0x04030201,
+            invalid_cell(&[0x01, 0x02, 0x03, 0x04]).into_dword_le().unwrap()
+        );
+        assert_eq!(
+            0x01020304,
+            invalid_cell(&[0x01, 0x02, 0x03, 0x04]).into_dword_be().unwrap()
+        );
     }
 
+    /// Regression test: a truncated/oversized resident DWORD used to silently decode as `0` — a
+    /// fabricated value indistinguishable from a genuine `DWORD:0` in a case report. It must
+    /// error instead.
     #[test]
-    fn into_dword_variants_return_zero_for_wrong_length() {
-        assert_eq!(0, invalid_cell(&[]).into_dword());
-        assert_eq!(0, invalid_cell(&[1, 2, 3]).into_dword());
-        assert_eq!(0, invalid_cell(&[1, 2, 3, 4, 5]).into_dword());
-        assert_eq!(0, invalid_cell(&[1, 2, 3]).into_dword_le());
-        assert_eq!(0, invalid_cell(&[1, 2, 3]).into_dword_be());
+    fn into_dword_variants_error_for_wrong_length() {
+        assert!(invalid_cell(&[]).into_dword().is_err());
+        assert!(invalid_cell(&[1, 2, 3]).into_dword().is_err());
+        assert!(invalid_cell(&[1, 2, 3, 4, 5]).into_dword().is_err());
+        assert!(invalid_cell(&[1, 2, 3]).into_dword_le().is_err());
+        assert!(invalid_cell(&[1, 2, 3]).into_dword_be().is_err());
     }
 
     #[test]
     fn into_qword_le_decodes_correct_length_content() {
         let cell = invalid_cell(&[1, 0, 0, 0, 0, 0, 0, 0]);
-        assert_eq!(1, cell.into_qword_le());
+        assert_eq!(1, cell.into_qword_le().unwrap());
     }
 
     #[test]
-    fn into_qword_le_returns_zero_for_wrong_length() {
-        assert_eq!(0, invalid_cell(&[]).into_qword_le());
-        assert_eq!(0, invalid_cell(&[1, 2, 3, 4, 5, 6, 7]).into_qword_le());
-        assert_eq!(0, invalid_cell(&[1, 2, 3, 4, 5, 6, 7, 8, 9]).into_qword_le());
+    fn into_qword_le_errors_for_wrong_length() {
+        assert!(invalid_cell(&[]).into_qword_le().is_err());
+        assert!(invalid_cell(&[1, 2, 3, 4, 5, 6, 7]).into_qword_le().is_err());
+        assert!(invalid_cell(&[1, 2, 3, 4, 5, 6, 7, 8, 9]).into_qword_le().is_err());
     }
 }

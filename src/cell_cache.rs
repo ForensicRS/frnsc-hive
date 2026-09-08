@@ -155,7 +155,7 @@ mod tst {
     use crate::cell::UnallocatedCell;
 
     fn cell_at(offset: u64) -> HiveCell {
-        HiveCell::Unallocated(UnallocatedCell { offset })
+        HiveCell::Unallocated(UnallocatedCell { offset, size: 0 })
     }
 
     #[test]

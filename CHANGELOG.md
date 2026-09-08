@@ -1,0 +1,59 @@
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+### Added
+
+- `HiveRegistryReader::findings`: accumulated `forensic_rs::pipeline::finding::Finding`s for
+  analyst-relevant integrity signals (checksum mismatches, unreplayed dirty hives, skipped/malformed
+  log entries, unparseable hives) that were previously only visible via `warn!` log lines.
+- `HiveFormatFactory`, implementing `forensic_rs::traits::format::FormatFactory` — probes a file for
+  the `regf` magic and base-block checksum, and mounts it (plus any discoverable `.LOG1`/`.LOG2`
+  companions) as `Mounted::Registry`. Supersedes the never-implemented `RegistryReaderFactory` this
+  crate's README referred to before forensic-rs 0.14 removed that trait.
+- `RecoverDeleted` implementation on `HiveRegistryReader`, carving deleted keys/values out of
+  unallocated hive cells, exposed generically via `Registry::as_recovery`. Strict plausibility
+  filtering (structural parse, in-range `FILETIME`, sane counts/flags) guards against false
+  positives — see `src/recovery.rs`'s module doc for the validation applied and its known
+  limitations (`RecoveredValue::key_hint` is always `None`; `RecoveredKey::parent_hint` falls back
+  to a `<HIVE>` provenance placeholder when no live parent can be resolved).
+- `cell::UnallocatedCell::size`: the free cell's declared length, needed by the deleted-cell
+  recovery scan (`UnallocatedCell::offset` alone wasn't enough to know how far to scan).
+- `Registry::values_raw_into`/`keys_raw_into` overrides, avoiding the intermediate `Vec` the default
+  implementations allocate.
+- `examples/`: five runnable examples (`load_hives_from_fs`, `mounted_registry_keys`,
+  `format_factory_mount`, `integrity_findings`, `carve_deleted_keys`) covering loading hives from a
+  filesystem, building a purely in-memory mounted registry, `HiveFormatFactory`/`MountResolver`,
+  `findings()`, and `RecoverDeleted`-based deleted-key carving, all runnable via `cargo run
+  --example <name>` from the crate root without requiring the gitignored SOFTWARE/SYSTEM fixtures.
+
+### Changed
+
+- Transaction-log replay failures (dirty hive with no covering log, malformed log entries,
+  out-of-bounds dirty pages) and base-block checksum mismatches now also record a `Finding` in
+  addition to the existing `warn!` line.
+- `HiveFiles::new_with_logs`/`open_hive_with_logs` no longer silently discard an unparseable hive —
+  the failure is recorded as a `ProcessingError` finding instead of vanishing via `.ok()`.
+- Truncated resident registry values (fewer bytes than their declared type requires) now return an
+  error instead of decoding as a fabricated `0`.
+- `hive_bins_data_size` (and other evidence-controlled length fields) are validated against the
+  actual file size before being used to size an allocation.
+- Bumped `edition` to `2024` and `rust-version` to `1.85`, matching forensic-rs 0.14.
+- `Cargo.toml` description no longer refers to the removed `RegistryReader` type.
+
+### Fixed
+
+- `hive::checksum_is_correct` now bounds-checks its input instead of indexing directly, avoiding a
+  panic on a shorter-than-expected buffer (relevant now that `HiveFormatFactory::probe` feeds it
+  arbitrary files).
+- `HashLeafCell::uppercase` checked membership in the exclusive range `b'a'..b'z'`, which never
+  matches `b'z'` — a subkey name's case-insensitive `HashLeaf` lookup hash differed depending on
+  whether it ended in a lowercase or uppercase `Z`, breaking lookups for such names.
+- `cell::InvalidCell::into_dword`/`into_dword_le`/`into_dword_be`/`into_qword_le` now return
+  `ForensicResult<_>` instead of silently decoding a truncated/oversized value as `0`.
+

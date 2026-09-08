@@ -8,10 +8,12 @@
 //! read one hive bin's 32-byte header plus its raw data; [read_cells] then splits that raw data
 //! into individual [crate::cell::HiveCell]s by repeatedly delegating to [crate::cell::read_cell].
 
-use forensic_rs::prelude::{ByteReader, ForensicError, ForensicResult, FromBytes, VirtualFile};
+use forensic_rs::prelude::{
+    ByteReader, Finding, FindingCategory, FindingSeverity, ForensicError, ForensicResult, FromBytes, VirtualFile,
+};
 use forensic_rs::warn;
 
-use crate::cell::{read_cell, HiveCell};
+use crate::cell::{HiveCell, read_cell};
 
 pub struct HivePrimaryFile {
     pub base_block: BaseBlock,
@@ -101,9 +103,18 @@ pub fn is_hive_data(buff: &[u8]) -> bool {
     &buff[0..4] == b"hbin"
 }
 
+/// XOR-32 checksum over the base block's first 508 bytes, compared against the stored checksum
+/// at offset 508..512. Returns `false` (rather than panicking) for a buffer too short to contain
+/// either region — relevant now that this is also called from format-probing code that may feed
+/// it an arbitrary, possibly truncated file.
 pub fn checksum_is_correct(buff: &[u8]) -> bool {
+    if buff.len() < 512 {
+        return false;
+    }
     let mut c: i32 = 0;
     for i in (0..508).step_by(4) {
+        // Bounds already guaranteed by the length check above; `unwrap_or_default` here is
+        // unreachable, not a fallback for truncated evidence.
         let v = i32::from_le_bytes(buff[i..i + 4].try_into().unwrap_or_default());
         c ^= v;
     }
@@ -208,7 +219,11 @@ fn read_base_block_w10(reader: &mut ByteReader) -> ForensicResult<BaseBlock> {
     })
 }
 
-pub fn read_base_block(file: &mut Box<dyn VirtualFile>) -> ForensicResult<BaseBlock> {
+/// Reads and validates the 4096-byte base block. A base-block checksum mismatch does not fail
+/// the read (the rest of the hive may still be usable) but is recorded both as a `warn!` line
+/// (for engineers) and as an `InvalidChecksum` [Finding] pushed onto `findings` (for analysts) —
+/// see the crate's `forensic-rs-tool-review` skill on the Finding/log/error three-way split.
+pub fn read_base_block(file: &mut Box<dyn VirtualFile>, findings: &mut Vec<Finding>) -> ForensicResult<BaseBlock> {
     let mut buffer = vec![0u8; 4096];
     file.read_exact(&mut buffer)?;
     if !is_valid_base_block(&buffer) {
@@ -216,6 +231,18 @@ pub fn read_base_block(file: &mut Box<dyn VirtualFile>) -> ForensicResult<BaseBl
     }
     if !checksum_is_correct(&buffer) {
         warn!("Incorrect checksum for Hive");
+        findings.push(
+            Finding::new(
+                FindingSeverity::High,
+                FindingCategory::InvalidChecksum,
+                "Hive base block checksum mismatch",
+            )
+            .with_description(
+                "The XOR-32 checksum over the hive's base block does not match the stored checksum. \
+             The header may be corrupted or the file truncated/tampered with; values read from \
+             this hive should be treated with caution.",
+            ),
+        );
     }
     let mut reader = ByteReader::new(&buffer);
     reader.skip(4)?; // "regf" signature, already validated by is_valid_base_block above
@@ -239,9 +266,7 @@ pub fn read_bin_header(file: &mut Box<dyn VirtualFile>) -> ForensicResult<HiveBi
     reader.read_as()
 }
 
-pub fn read_hive_bin_at_file_position(
-    file: &mut Box<dyn VirtualFile>,
-) -> ForensicResult<(HiveBinHeader, Vec<u8>)> {
+pub fn read_hive_bin_at_file_position(file: &mut Box<dyn VirtualFile>) -> ForensicResult<(HiveBinHeader, Vec<u8>)> {
     let initial_offset = file.stream_position().unwrap_or_default();
     let header = match read_bin_header(file) {
         Ok(v) => v,
@@ -259,13 +284,19 @@ pub fn read_hive_bin_at_file_position(
     Ok((header, buff))
 }
 
-pub fn read_cells(data: &[u8], bin_offset: u64) -> ForensicResult<Vec<HiveCell>> {
+/// Splits `data` (one hive bin's raw content) into individual [HiveCell]s. A cell that fails to
+/// parse (unrecognized/corrupt content past a plausible length prefix) is skipped rather than
+/// aborting the whole bin — but skipped cells are tallied and reported as a single aggregate
+/// `IntegrityIssue` [Finding] pushed onto `findings` (one per bin, not one per cell — a bin with
+/// many skipped cells would otherwise flood the findings list with duplicates of the same signal).
+pub fn read_cells(data: &[u8], bin_offset: u64, findings: &mut Vec<Finding>) -> ForensicResult<Vec<HiveCell>> {
     let len = data.len();
     if len < 4 {
         return Err(ForensicError::registry_hive_error("hive_cell", "too small"));
     }
     let mut offset = 0usize;
     let mut list = Vec::with_capacity(128);
+    let mut skipped = 0u32;
     loop {
         if offset > len {
             return Err(ForensicError::registry_hive_error(
@@ -292,12 +323,27 @@ pub fn read_cells(data: &[u8], bin_offset: u64) -> ForensicResult<Vec<HiveCell>>
         let cell = match read_cell(cell_data, bin_offset + offset as u64) {
             Ok(v) => v,
             Err(_e) => {
+                skipped += 1;
                 offset += cell_len;
                 continue;
             }
         };
         list.push(cell);
         offset += cell_len;
+    }
+    if skipped > 0 {
+        findings.push(
+            Finding::new(
+                FindingSeverity::Medium,
+                FindingCategory::IntegrityIssue,
+                "Unparseable cells skipped in hive bin",
+            )
+            .with_description(format!(
+                "{skipped} cell(s) in the hive bin at offset {bin_offset} had an unrecognized \
+                 or corrupt signature and were skipped; the parsed subkey/value tree for this bin \
+                 may be incomplete."
+            )),
+        );
     }
     Ok(list)
 }
@@ -310,13 +356,13 @@ mod tst {
     fn can_read_hive_header_block() {
         let fs = init_virtual_fs();
         let mut sam_file = read_sam_hive(&fs);
-        let base_block = read_base_block(&mut sam_file).unwrap();
+        let base_block = read_base_block(&mut sam_file, &mut Vec::new()).unwrap();
         assert_eq!(
             str_to_unicode_with_ending(b"\\SystemRoot\\System32\\Config\\SAM"),
             &base_block.file_name[0..64]
         );
         let mut sec_file: Box<dyn VirtualFile> = read_sec_hive(&fs);
-        let base_block = read_base_block(&mut sec_file).unwrap();
+        let base_block = read_base_block(&mut sec_file, &mut Vec::new()).unwrap();
         assert_eq!(
             str_to_unicode_with_ending(b"emRoot\\System32\\Config\\SECURITY"),
             &base_block.file_name[0..64]
@@ -327,26 +373,27 @@ mod tst {
     fn can_read_sam_hive_data() {
         let fs = init_virtual_fs();
         let mut sam_file = read_sam_hive(&fs);
-        let base_block = read_base_block(&mut sam_file).unwrap();
+        let base_block = read_base_block(&mut sam_file, &mut Vec::new()).unwrap();
         // Position to 4096 + offset -32 (header)
         sam_file
-            .seek(std::io::SeekFrom::Start(
-                4096 + base_block.root_cell_offset as u64 - 32,
-            ))
+            .seek(std::io::SeekFrom::Start(4096 + base_block.root_cell_offset as u64 - 32))
             .unwrap();
         let hive_bin = read_hive_bin_at_file_position(&mut sam_file).unwrap();
-        read_cells(&hive_bin.1, 4096 + base_block.root_cell_offset as u64 - 32).unwrap();
-        let mut i = 0;
+        read_cells(
+            &hive_bin.1,
+            4096 + base_block.root_cell_offset as u64 - 32,
+            &mut Vec::new(),
+        )
+        .unwrap();
         let mut offset = 4096 + base_block.root_cell_offset as u64 - 32;
         let mut cell_offset = 32;
         loop {
             if offset >= base_block.hive_bins_data_size.into() {
                 break;
             }
-            i = i + 1;
             sam_file.seek(std::io::SeekFrom::Start(offset)).unwrap();
             let hive_bin = read_hive_bin_at_file_position(&mut sam_file).unwrap();
-            let cells = read_cells(&hive_bin.1, cell_offset).unwrap();
+            let cells = read_cells(&hive_bin.1, cell_offset, &mut Vec::new()).unwrap();
             println!("{:?}", cells);
             offset += hive_bin.0.size as u64;
             cell_offset += hive_bin.0.size as u64;
@@ -356,22 +403,21 @@ mod tst {
     fn can_read_security_hive_data() {
         let fs = init_virtual_fs();
         let mut sec_file = read_sec_hive(&fs);
-        let base_block = read_base_block(&mut sec_file).unwrap();
+        let base_block = read_base_block(&mut sec_file, &mut Vec::new()).unwrap();
         // Position to 4096 + offset -32 (header)
 
-        let mut i = 0;
         let mut offset = 4096 + base_block.root_cell_offset as u64 - 32;
 
         loop {
             if offset >= base_block.hive_bins_data_size.into() {
                 break;
             }
-            i = i + 1;
             sec_file.seek(std::io::SeekFrom::Start(offset)).unwrap();
             let hive_bin = read_hive_bin_at_file_position(&mut sec_file).unwrap();
             let cells = read_cells(
                 &hive_bin.1,
                 offset - 4064 - base_block.root_cell_offset as u64,
+                &mut Vec::new(),
             )
             .unwrap();
             println!("{:?}", cells);
@@ -384,22 +430,21 @@ mod tst {
     fn can_read_software_hive_data() {
         let fs = init_virtual_fs();
         let mut sec_file = read_software_hive(&fs);
-        let base_block = read_base_block(&mut sec_file).unwrap();
+        let base_block = read_base_block(&mut sec_file, &mut Vec::new()).unwrap();
         // Position to 4096 + offset -32 (header)
 
-        let mut i = 0;
         let mut offset = 4096 + base_block.root_cell_offset as u64 - 32;
 
         loop {
             if offset >= base_block.hive_bins_data_size.into() {
                 break;
             }
-            i = i + 1;
             sec_file.seek(std::io::SeekFrom::Start(offset)).unwrap();
             let hive_bin = read_hive_bin_at_file_position(&mut sec_file).unwrap();
             let cells = read_cells(
                 &hive_bin.1,
                 offset - 4064 - base_block.root_cell_offset as u64,
+                &mut Vec::new(),
             )
             .unwrap();
             println!("{:?}", cells);
@@ -411,22 +456,21 @@ mod tst {
     fn can_read_supersecretadmin_hive_data() {
         let fs = init_virtual_fs();
         let mut sec_file = read_supersecretadmin_hive(&fs);
-        let base_block = read_base_block(&mut sec_file).unwrap();
+        let base_block = read_base_block(&mut sec_file, &mut Vec::new()).unwrap();
         // Position to 4096 + offset -32 (header)
 
-        let mut i = 0;
         let mut offset = 4096 + base_block.root_cell_offset as u64 - 32;
 
         loop {
             if offset >= base_block.hive_bins_data_size.into() {
                 break;
             }
-            i = i + 1;
             sec_file.seek(std::io::SeekFrom::Start(offset)).unwrap();
             let hive_bin = read_hive_bin_at_file_position(&mut sec_file).unwrap();
             let cells = read_cells(
                 &hive_bin.1,
                 offset - 4064 - base_block.root_cell_offset as u64,
+                &mut Vec::new(),
             )
             .unwrap();
             println!("{:?}", cells);
@@ -445,6 +489,6 @@ mod tst {
         let mut data = (-8i32).to_le_bytes().to_vec();
         data.extend_from_slice(&[0xAA, 0xAA, 0xAA, 0xAA]);
         data.push(0xFF); // truncated trailing cell: only 1 byte where a length prefix is expected
-        assert!(read_cells(&data, 0).is_err());
+        assert!(read_cells(&data, 0, &mut Vec::new()).is_err());
     }
 }

@@ -15,20 +15,16 @@ pub(crate) fn init_virtual_fs() -> Arc<dyn FileSystem> {
 }
 
 pub(crate) fn read_sam_hive(fs: &Arc<dyn FileSystem>) -> Box<dyn VirtualFile> {
-    fs.open(FPath::new("C:\\Windows\\System32\\Config\\SAM"))
-        .unwrap()
+    fs.open(FPath::new("C:\\Windows\\System32\\Config\\SAM")).unwrap()
 }
 pub(crate) fn read_sec_hive(fs: &Arc<dyn FileSystem>) -> Box<dyn VirtualFile> {
-    fs.open(FPath::new("C:\\Windows\\System32\\Config\\SECURITY"))
-        .unwrap()
+    fs.open(FPath::new("C:\\Windows\\System32\\Config\\SECURITY")).unwrap()
 }
 pub(crate) fn read_software_hive(fs: &Arc<dyn FileSystem>) -> Box<dyn VirtualFile> {
-    fs.open(FPath::new("C:\\Windows\\System32\\Config\\SOFTWARE"))
-        .unwrap()
+    fs.open(FPath::new("C:\\Windows\\System32\\Config\\SOFTWARE")).unwrap()
 }
 pub(crate) fn read_supersecretadmin_hive(fs: &Arc<dyn FileSystem>) -> Box<dyn VirtualFile> {
-    fs.open(FPath::new("C:\\Users\\SuperSecretAdmin\\NTUSER.DAT"))
-        .unwrap()
+    fs.open(FPath::new("C:\\Users\\SuperSecretAdmin\\NTUSER.DAT")).unwrap()
 }
 
 #[allow(dead_code)]

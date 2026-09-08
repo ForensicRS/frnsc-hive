@@ -33,11 +33,13 @@ use std::{
 use forensic_rs::prelude::*;
 
 use crate::{
-    cell::{peek_cell, read_cell, HashLeafCell, HiveCell, KeyNodeCell},
+    cell::{HashLeafCell, HiveCell, KeyNodeCell, peek_cell, read_cell},
     cell_cache::CellCache,
     consts::{HIVE_BASE_BLOCK_SIZE, ROOT_CELL_OFFSET},
-    hive::{read_base_block, read_cells, read_hive_bin_at_file_position, BaseBlock},
-    mounted_map::MountedMap,
+    hive::{BaseBlock, read_base_block, read_cells, read_hive_bin_at_file_position},
+    log::{apply_entries, read_log_entries, select_entries_to_apply},
+    mounted_map::{MountedCell, MountedMap},
+    recovery,
 };
 
 const DATA_TYPE_NONE: u32 = 0x0;
@@ -82,6 +84,11 @@ pub struct HiveRegistryReader {
     key_counter: Mutex<u64>,
     /// Other mounted hives
     others: Vec<(String, Mutex<HiveFiles>)>,
+    /// Analyst-relevant integrity signals accumulated while loading/replaying hives (checksum
+    /// mismatches, dirty hives opened without a covering log, skipped log entries, unparseable
+    /// hives) — in addition to, not instead of, the `warn!`/`debug!` log lines aimed at engineers.
+    /// See [Self::findings].
+    findings: Mutex<Vec<Finding>>,
 }
 
 impl Default for HiveRegistryReader {
@@ -102,7 +109,25 @@ impl HiveRegistryReader {
     /// ```
     pub fn from_fs(fs: Arc<dyn FileSystem>) -> ForensicResult<Box<dyn Registry>> {
         let config_folder = FPath::new("C:\\Windows\\System32\\Config");
-        HiveRegistryReaderFactory.open(fs, config_folder)
+        let mut reader = HiveRegistryReader::new();
+        let mut findings = Vec::new();
+        if let Some(hive) = open_hive_with_logs(&fs, config_folder, "SYSTEM", &mut findings) {
+            reader.set_system(hive);
+        }
+        if let Some(hive) = open_hive_with_logs(&fs, config_folder, "SOFTWARE", &mut findings) {
+            reader.set_software(hive);
+        }
+        if let Some(hive) = open_hive_with_logs(&fs, config_folder, "SECURITY", &mut findings) {
+            reader.set_security(hive);
+        }
+        if let Some(hive) = open_hive_with_logs(&fs, config_folder, "SAM", &mut findings) {
+            reader.set_sam(hive);
+        }
+        reader.record_findings(findings);
+        if let Err(e) = reader.load_user_hives(&fs) {
+            warn!("Error loading user hives: {:?}", e);
+        }
+        Ok(Box::new(reader))
     }
 
     pub fn new() -> Self {
@@ -117,7 +142,26 @@ impl HiveRegistryReader {
             mounted: Mutex::new(MountedMap::new()),
             cached_keys: Mutex::new(BTreeMap::new()),
             key_counter: Mutex::new(0),
+            findings: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Analyst-relevant integrity signals accumulated so far — base-block checksum mismatches,
+    /// dirty hives opened without a covering transaction log, skipped/malformed log entries, and
+    /// hives that were found but could not be parsed — in insertion order. This is *in addition
+    /// to*, not instead of, the `warn!`/`debug!` log lines emitted for the same conditions: those
+    /// are for engineers debugging this crate, this is the analyst-facing channel (see the
+    /// `forensic-rs-tool-review` skill's Finding/log/error split).
+    pub fn findings(&self) -> Vec<Finding> {
+        self.findings.lock().unwrap().clone()
+    }
+
+    /// Appends `new` onto the accumulated [Self::findings], preserving insertion order.
+    pub(crate) fn record_findings(&self, new: Vec<Finding>) {
+        if new.is_empty() {
+            return;
+        }
+        self.findings.lock().unwrap().extend(new);
     }
 
     /// Searches and loads all the users that have hives, using the SOFTWARE hive's
@@ -125,11 +169,12 @@ impl HiveRegistryReader {
     /// [forensic_rs::traits::registry::windows::users]).
     pub fn load_user_hives(&mut self, fs: &Arc<dyn FileSystem>) -> ForensicResult<()> {
         let profiles = windows::users(&*self)?;
+        let mut findings = Vec::new();
         for profile in profiles {
             if profile.profile_path.as_str().is_empty() {
                 continue;
             }
-            let hive = match open_hive_with_logs(fs, profile.profile_path.as_path(), "NTUSER.DAT") {
+            let hive = match open_hive_with_logs(fs, profile.profile_path.as_path(), "NTUSER.DAT", &mut findings) {
                 Some(v) => v,
                 None => {
                     warn!(
@@ -141,6 +186,7 @@ impl HiveRegistryReader {
             };
             self.add_user(&profile.sid, hive);
         }
+        self.record_findings(findings);
         Ok(())
     }
 
@@ -216,35 +262,41 @@ impl HiveRegistryReader {
         if hkey == "HKEY_LOCAL_MACHINE" {
             let mut splited = path.split(['/', '\\']);
             if let Some(first_key) = splited.next() {
+                // Store using exactly the hive-relative path shape `HiveFiles::open_key_from_offset`
+                // will see as `key_name` for this kind: SAM/SECURITY/SYSTEM pass `path` through
+                // unstripped (their hive's own root has a child literally named e.g. "SAM"), while
+                // SOFTWARE strips its own leading segment — mirrors `open_under_lm`'s stripping
+                // (`src/reader.rs`, `open_under_lm`). A mismatch here would make the value
+                // unreachable once stored, since `HiveFiles.mounted` and the real-tree walk must
+                // agree on path shape.
                 if first_key == "SAM" && self.sam.is_some() {
                     self.sam.as_ref().inspect(|hive| {
-                        hive.lock().unwrap().add_mounted_value(full_path, value, data);
+                        hive.lock().unwrap().add_mounted_value(path, value, data);
                     });
                     return;
                 } else if first_key == "SECURITY" && self.security.is_some() {
                     self.security.as_ref().inspect(|hive| {
-                        hive.lock().unwrap().add_mounted_value(full_path, value, data);
+                        hive.lock().unwrap().add_mounted_value(path, value, data);
                     });
                     return;
                 } else if first_key == "SYSTEM" && self.system.is_some() {
                     self.system.as_ref().inspect(|hive| {
-                        hive.lock().unwrap().add_mounted_value(full_path, value, data);
+                        hive.lock().unwrap().add_mounted_value(path, value, data);
                     });
                     return;
                 } else if first_key == "SOFTWARE" && self.software.is_some() {
+                    let sub_path = path.get(first_key.len() + 1..).unwrap_or("");
                     self.software.as_ref().inspect(|hive| {
-                        hive.lock().unwrap().add_mounted_value(full_path, value, data);
+                        hive.lock().unwrap().add_mounted_value(sub_path, value, data);
                     });
                     return;
                 }
             }
         } else if hkey == "HKEY_USERS" {
-            let mut splited = path.split(['/', '\\']);
-            if let Some(first_key) = splited.next() {
-                for (guid, hive) in &self.users {
-                    if first_key == guid {
-                        return hive.lock().unwrap().add_mounted_value(full_path, value, data);
-                    }
+            let (username, rest_of_path) = path.split_once(['/', '\\']).unwrap_or((path, ""));
+            for (guid, hive) in &self.users {
+                if username == guid {
+                    return hive.lock().unwrap().add_mounted_value(rest_of_path, value, data);
                 }
             }
         }
@@ -300,6 +352,35 @@ impl HiveRegistryReader {
         }
     }
 
+    /// Looks up the path registered for a [HiveKind::Cached] id, assuming it's already been
+    /// validated via [Self::require_cached_key].
+    fn cached_key_path(&self, id: u64) -> ForensicResult<String> {
+        self.cached_keys
+            .lock()
+            .unwrap()
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| ForensicError::registry_invalid_handle(id as i64))
+    }
+
+    fn cached_key_values(&self, id: u64) -> ForensicResult<Vec<(String, RegValue)>> {
+        let path = self.cached_key_path(id)?;
+        let mounted = self.mounted.lock().unwrap();
+        Ok(match mounted.get_cell(&path) {
+            Some(cell) => mounted_cell_values(cell),
+            None => Vec::new(),
+        })
+    }
+
+    fn cached_key_names(&self, id: u64) -> ForensicResult<Vec<KeyEntry>> {
+        let path = self.cached_key_path(id)?;
+        let mounted = self.mounted.lock().unwrap();
+        Ok(match mounted.get_cell(&path) {
+            Some(cell) => mounted_cell_keys(cell),
+            None => Vec::new(),
+        })
+    }
+
     /// Resolves a real-hive-backed [HiveKind] (everything except the synthetic [HiveKind::LmRoot]/
     /// [HiveKind::UsersRoot]/[HiveKind::Cached]) to its underlying [HiveFiles].
     fn hive_for_kind(&self, kind: HiveKind) -> ForensicResult<&Mutex<HiveFiles>> {
@@ -331,9 +412,10 @@ impl HiveRegistryReader {
                 .get(pos as usize)
                 .map(|(_, h)| h)
                 .ok_or_else(|| ForensicError::registry_invalid_handle(pos as i64)),
-            HiveKind::LmRoot | HiveKind::UsersRoot | HiveKind::Cached => {
-                Err(ForensicError::other("registry", "not a real-hive-backed key".to_string()))
-            }
+            HiveKind::LmRoot | HiveKind::UsersRoot | HiveKind::Cached => Err(ForensicError::other(
+                "registry",
+                "not a real-hive-backed key".to_string(),
+            )),
         }
     }
 
@@ -366,7 +448,10 @@ impl HiveRegistryReader {
             self.cached_keys.lock().unwrap().insert(id, full_path);
             return Ok(pack_raw_key(HiveKind::Cached, id));
         }
-        Err(ForensicError::registry_key_not_found(PredefinedHive::LocalMachine, Some(key_name.into())))
+        Err(ForensicError::registry_key_not_found(
+            PredefinedHive::LocalMachine,
+            Some(key_name.into()),
+        ))
     }
 
     fn open_under_users(&self, key_name: &str) -> ForensicResult<RawKey> {
@@ -379,14 +464,14 @@ impl HiveRegistryReader {
         let (_, hive) = &self.users[position];
         let mut h = try_lock_hive(hive)?;
         let offset = h.open_key_from_offset(rest_of_path, ROOT_CELL_OFFSET as i64)?;
-        Ok(pack_raw_key(HiveKind::User(position as u16), offset as u64))
+        Ok(pack_raw_key(HiveKind::User(position as u16), offset.to_payload()))
     }
 
     fn open_in_kind(&self, kind: HiveKind, key_name: &str) -> ForensicResult<RawKey> {
         let hive = self.hive_for_kind(kind)?;
         let mut h = try_lock_hive(hive)?;
         let offset = h.open_key_from_offset(key_name, ROOT_CELL_OFFSET as i64)?;
-        Ok(pack_raw_key(kind, offset as u64))
+        Ok(pack_raw_key(kind, offset.to_payload()))
     }
 }
 
@@ -395,6 +480,26 @@ impl HiveRegistryReader {
 /// spots stay greppable until the feature is actually built.
 fn not_implemented(feature: &str) -> ForensicError {
     ForensicError::other("registry", format!("{feature} is not implemented yet"))
+}
+
+/// Shared mapping from a [crate::mounted_map::MountedCell]'s values to the `(String, RegValue)`
+/// shape [Registry::values_raw] expects — used by both the reader-level [HiveKind::Cached] arms
+/// and (once implemented) the per-hive mounted-key arms, so the mapping only lives in one place.
+fn mounted_cell_values(cell: &crate::mounted_map::MountedCell) -> Vec<(String, RegValue)> {
+    cell.value_entries().map(|(k, v)| (k.to_string(), v.clone())).collect()
+}
+
+/// Shared mapping from a [crate::mounted_map::MountedCell]'s child key names to [KeyEntry] —
+/// mounted keys have no real on-disk timestamp, so `last_write` is always `None`, matching the
+/// synthetic [HiveKind::LmRoot]/[HiveKind::UsersRoot] entries.
+fn mounted_cell_keys(cell: &crate::mounted_map::MountedCell) -> Vec<KeyEntry> {
+    cell.key_names()
+        .map(|name| KeyEntry {
+            name: name.to_string(),
+            last_write: None,
+            allocated: true,
+        })
+        .collect()
 }
 
 /// Locks a hive without blocking (`try_lock`, not `lock`) so a re-entrant lock attempt (e.g. a
@@ -411,7 +516,7 @@ fn try_lock_hive(hive: &Mutex<HiveFiles>) -> ForensicResult<MutexGuard<'_, HiveF
 /// doesn't align to 4-byte offset entries — a corruption signal in its own right — so this
 /// returns an `Err` rather than silently truncating the trailing partial entry.
 fn parse_offsets_list(content: &[u8]) -> ForensicResult<Vec<u32>> {
-    if !content.len().is_multiple_of(4) {
+    if content.len() % 4 != 0 {
         return Err(ForensicError::registry_cell_error(
             "key_values_offsets_list",
             format!(
@@ -487,7 +592,7 @@ fn decode_resident_value(data_type: u32, data_offset: u32, cached_size: i32) -> 
 /// Decodes a `KeyValueCell`'s data given its already-extracted `data_type`/`data_offset`/
 /// `data_size`/`flags` fields. Shared by the eager ([read_value_from_hive]/[values_from_hive])
 /// and lazy ([HiveValuesIter]) enumeration paths.
-fn decode_value_cell(
+pub(crate) fn decode_value_cell(
     hive: &mut HiveFiles,
     data_type: u32,
     data_offset: u32,
@@ -525,17 +630,17 @@ fn decode_value_cell(
             other => Err(unexpected_value_cell(data_type, data_offset, other)),
         },
         DATA_TYPE_REG_DWORD => match data_cell {
-            HiveCell::Invalid(ic) => Ok(RegValue::DWord(ic.into_dword_le())),
+            HiveCell::Invalid(ic) => Ok(RegValue::DWord(ic.into_dword_le()?)),
             HiveCell::Unallocated(_) => Err(unallocated_value_error(data_type, data_offset)),
             other => Err(unexpected_value_cell(data_type, data_offset, other)),
         },
         DATA_TYPE_REG_DWORD_BE => match data_cell {
-            HiveCell::Invalid(ic) => Ok(RegValue::DWord(ic.into_dword_be())),
+            HiveCell::Invalid(ic) => Ok(RegValue::DWord(ic.into_dword_be()?)),
             HiveCell::Unallocated(_) => Err(unallocated_value_error(data_type, data_offset)),
             other => Err(unexpected_value_cell(data_type, data_offset, other)),
         },
         DATA_TYPE_REG_QWORD => match data_cell {
-            HiveCell::Invalid(ic) => Ok(RegValue::QWord(ic.into_qword_le())),
+            HiveCell::Invalid(ic) => Ok(RegValue::QWord(ic.into_qword_le()?)),
             HiveCell::Unallocated(_) => Err(unallocated_value_error(data_type, data_offset)),
             other => Err(unexpected_value_cell(data_type, data_offset, other)),
         },
@@ -555,7 +660,11 @@ fn read_value_from_hive(hive: &mut HiveFiles, offset: u64, value_name: &str) -> 
     let cell = hive.get_cell_at_offset(offset)?;
     let kn = match cell {
         HiveCell::KeyNode(kn) => kn,
-        _ => return Err(ForensicError::registry_cell_structure_error("key_node", offset, "KeyNode")),
+        _ => {
+            return Err(ForensicError::registry_cell_structure_error(
+                "key_node", offset, "KeyNode",
+            ));
+        }
     };
     let key_values_list_offset = kn.key_values_list_offset;
     let number_key_values = kn.number_key_values;
@@ -581,8 +690,23 @@ fn read_value_from_hive(hive: &mut HiveFiles, offset: u64, value_name: &str) -> 
             }
         }
     }
-    let (data_offset, data_size, data_type, flags) = data
-        .ok_or_else(|| ForensicError::registry_value_not_found(PredefinedHive::LocalMachine, None, value_name))?;
+    let (data_offset, data_size, data_type, flags) = match data {
+        Some(v) => v,
+        None => {
+            // Not among this key's real values — check for a value mounted directly on this same
+            // (real) key's hive-relative path, if known (see HiveFiles::merge_mounted_values).
+            if let Some(path) = hive.real_key_paths.get(&offset) {
+                if let Some(v) = hive.mounted.get_value(path, value_name) {
+                    return Ok(v);
+                }
+            }
+            return Err(ForensicError::registry_value_not_found(
+                PredefinedHive::LocalMachine,
+                None,
+                value_name,
+            ));
+        }
+    };
     decode_value_cell(hive, data_type, data_offset, data_size, flags)
 }
 
@@ -590,7 +714,11 @@ fn values_from_hive(hive: &mut HiveFiles, offset: u64) -> ForensicResult<Vec<(St
     let cell = hive.get_cell_at_offset(offset)?;
     let key_node = match cell {
         HiveCell::KeyNode(v) => v,
-        _ => return Err(ForensicError::registry_cell_structure_error("key_node", offset, "KeyNode")),
+        _ => {
+            return Err(ForensicError::registry_cell_structure_error(
+                "key_node", offset, "KeyNode",
+            ));
+        }
     };
     let key_values_list_offset = key_node.key_values_list_offset;
     let number_key_values = key_node.number_key_values;
@@ -606,7 +734,13 @@ fn values_from_hive(hive: &mut HiveFiles, offset: u64) -> ForensicResult<Vec<(St
             Err(_) => continue,
         };
         let (name, data_type, data_offset, data_size, flags) = match value_cell {
-            HiveCell::KeyValue(kv) => (kv.value_name.clone(), kv.data_type, kv.data_offset, kv.data_size, kv.flags),
+            HiveCell::KeyValue(kv) => (
+                kv.value_name.clone(),
+                kv.data_type,
+                kv.data_offset,
+                kv.data_size,
+                kv.flags,
+            ),
             _ => continue,
         };
         match decode_value_cell(hive, data_type, data_offset, data_size, flags) {
@@ -621,6 +755,7 @@ fn values_from_hive(hive: &mut HiveFiles, offset: u64) -> ForensicResult<Vec<(St
             number_key_values
         );
     }
+    hive.merge_mounted_values(offset, &mut results);
     Ok(results)
 }
 
@@ -628,12 +763,18 @@ fn keys_from_hive(hive: &mut HiveFiles, offset: u64) -> ForensicResult<Vec<KeyEn
     let cell = hive.get_cell_at_offset(offset)?;
     let key_node = match cell {
         HiveCell::KeyNode(v) => v,
-        _ => return Err(ForensicError::registry_cell_structure_error("key_node", offset, "KeyNode")),
+        _ => {
+            return Err(ForensicError::registry_cell_structure_error(
+                "key_node", offset, "KeyNode",
+            ));
+        }
     };
     let subkeys_list_offset = key_node.subkeys_list_offset;
     let number_subkeys = key_node.number_subkeys;
     if number_subkeys == 0 {
-        return Ok(Vec::new());
+        let mut subkeys = Vec::new();
+        hive.merge_mounted_children(offset, &mut subkeys);
+        return Ok(subkeys);
     }
     let mut offsets: Vec<u32> = match hive.get_cell_at_offset(subkeys_list_offset as u64)? {
         HiveCell::HashLeaf(v) => v.elements.iter().map(|v| v.offset).collect(),
@@ -645,7 +786,7 @@ fn keys_from_hive(hive: &mut HiveFiles, offset: u64) -> ForensicResult<Vec<KeyEn
                 "subkeys_list",
                 subkeys_list_offset as u64,
                 "leaf/index cell",
-            ))
+            ));
         }
     };
     let mut subkeys = Vec::with_capacity(number_subkeys as usize);
@@ -671,6 +812,7 @@ fn keys_from_hive(hive: &mut HiveFiles, offset: u64) -> ForensicResult<Vec<KeyEn
         }
         pos += 1;
     }
+    hive.merge_mounted_children(offset, &mut subkeys);
     Ok(subkeys)
 }
 
@@ -729,7 +871,8 @@ fn pack_raw_key(kind: HiveKind, payload: u64) -> RawKey {
         HiveKind::Other(pos) => (KIND_OTHER, pos as u64),
         HiveKind::Cached => (KIND_CACHED, 0),
     };
-    let raw = (payload & PAYLOAD_MASK) | ((tag & KIND_MASK) << KIND_SHIFT) | ((position & POSITION_MASK) << POSITION_SHIFT);
+    let raw =
+        (payload & PAYLOAD_MASK) | ((tag & KIND_MASK) << KIND_SHIFT) | ((position & POSITION_MASK) << POSITION_SHIFT);
     RawKey::from_raw(raw)
 }
 
@@ -755,6 +898,40 @@ fn unpack_raw_key(key: &RawKey) -> ForensicResult<(HiveKind, u64)> {
         _ => return Err(ForensicError::registry_invalid_handle(raw as i64)),
     };
     Ok((kind, payload))
+}
+
+/// Marks bit 47 of a real-hive-kind [RawKey]'s 48-bit payload to distinguish a genuine on-disk
+/// cell offset ([HiveOffset::Real]) from an id into a [HiveFiles]'s own `mounted_keys` table
+/// ([HiveOffset::Mounted]). Real cell offsets are always `u32`-bounded (`hive_bins_data_size:
+/// u32`), so they can never reach `2^47` — this flag is collision-free without touching
+/// `pack_raw_key`/`unpack_raw_key`'s existing tag/position bits, and it stays in unsigned
+/// arithmetic throughout (unlike the dead `if offset < 0` convention this replaces, which lost
+/// its sign the moment it was masked by `PAYLOAD_MASK`).
+const MOUNTED_PAYLOAD_FLAG: u64 = 1 << 47;
+
+/// A cell offset resolved by [HiveFiles::open_key_from_offset]/[HiveFiles::open_mounted_child]:
+/// either a genuine on-disk cell offset, or an id into that [HiveFiles]'s own `mounted_keys`
+/// table for a REG-injected key mounted underneath this (otherwise real) hive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HiveOffset {
+    Real(u64),
+    Mounted(u64),
+}
+
+impl HiveOffset {
+    fn to_payload(self) -> u64 {
+        match self {
+            HiveOffset::Real(offset) => offset & PAYLOAD_MASK,
+            HiveOffset::Mounted(id) => (id & PAYLOAD_MASK) | MOUNTED_PAYLOAD_FLAG,
+        }
+    }
+    fn from_payload(payload: u64) -> Self {
+        if payload & MOUNTED_PAYLOAD_FLAG != 0 {
+            HiveOffset::Mounted(payload & !MOUNTED_PAYLOAD_FLAG)
+        } else {
+            HiveOffset::Real(payload)
+        }
+    }
 }
 
 /// Lazy [Registry::keys_iter_raw] iterator: resolves one subkey at a time, only reading each
@@ -814,7 +991,13 @@ impl<'a> Iterator for HiveValuesIter<'a> {
                 }
             };
             let (name, data_type, data_offset, data_size, flags) = match cell {
-                HiveCell::KeyValue(kv) => (kv.value_name.clone(), kv.data_type, kv.data_offset, kv.data_size, kv.flags),
+                HiveCell::KeyValue(kv) => (
+                    kv.value_name.clone(),
+                    kv.data_type,
+                    kv.data_offset,
+                    kv.data_size,
+                    kv.flags,
+                ),
                 _ => continue,
             };
             match decode_value_cell(&mut self.hive, data_type, data_offset, data_size, flags) {
@@ -833,18 +1016,56 @@ pub struct HiveFiles {
     pub(crate) primary: Box<dyn VirtualFile>,
     pub base_block: BaseBlock,
     pub(crate) root_cell: KeyNodeCell,
-    pub(crate) logs: Vec<Box<dyn VirtualFile>>,
     pub(crate) cell_cache: CellCache,
     pub(crate) buffer: Vec<u8>,
+    /// REG-injected keys/values mounted underneath this (otherwise real, on-disk) hive. Keyed by
+    /// hive-relative paths — no leading `HKEY_LOCAL_MACHINE\<HIVE>\` or `HKEY_USERS\<guid>\`
+    /// prefix — matching exactly what [Self::open_key_from_offset] receives as `key_name`. See
+    /// [Self::add_mounted_value].
     pub(crate) mounted: MountedMap,
+    /// Associates a [HiveOffset::Mounted] id with the hive-relative path it was opened for, so a
+    /// later value/key-enumeration call on that id can look the path back up in `mounted`.
+    pub(crate) mounted_keys: BTreeMap<u64, String>,
+    pub(crate) mounted_key_counter: u64,
+    /// Associates a *real* cell offset with the hive-relative path it was opened through (seeded
+    /// with `ROOT_CELL_OFFSET -> ""`), populated as [Self::open_key_from_offset] resolves paths.
+    /// Lets a real key's value/key enumeration also look up (and merge in) any values/subkeys
+    /// mounted directly underneath that same path in `mounted`, not just keys reachable by
+    /// falling back to `mounted` wholesale when the real tree walk fails outright. Only offsets
+    /// actually reached via a path-based open are known here — a real key never opened by name
+    /// (e.g. only ever reached by raw offset) won't have mounted overlays merged, which is a
+    /// narrower, accepted version of the "chained opens into non-root real keys" limitation noted
+    /// on [Self::open_key_from_offset].
+    pub(crate) real_key_paths: BTreeMap<u64, String>,
+    /// An in-memory, log-replay-patched copy of the hive-bins-data region, populated only when
+    /// [Self::new_with_logs] actually applied at least one log entry. When `Some`,
+    /// [Self::get_cell_at_offset] reads from here instead of seeking `primary` — clean hives and
+    /// hives opened without logs never populate this, so they pay zero extra cost.
+    pub(crate) patched_bins: Option<Vec<u8>>,
+    /// The sequence number [Self::new_with_logs] recovered up to, if log replay applied anything.
+    pub(crate) recovered_sequence: Option<u32>,
 }
 
 impl HiveFiles {
-    pub fn new(location: FPathBuf, mut primary: Box<dyn VirtualFile>) -> ForensicResult<Self> {
-        let base_block = read_base_block(&mut primary)?;
+    /// Like [Self::new_with_findings], but for callers that don't need the integrity findings
+    /// collected during the parse (e.g. tests, or a caller constructing a [HiveFiles] to hand to
+    /// [HiveRegistryReader::set_sam]/[HiveRegistryReader::set_software]/etc. directly).
+    pub fn new(location: FPathBuf, primary: Box<dyn VirtualFile>) -> ForensicResult<Self> {
+        Self::new_with_findings(location, primary, &mut Vec::new())
+    }
+
+    /// Parses a primary hive file's base block and root hive bin. `findings` collects
+    /// analyst-relevant integrity signals encountered while parsing (base-block checksum
+    /// mismatch, unparseable cells) — see [crate::hive::read_base_block]/[crate::hive::read_cells].
+    pub fn new_with_findings(
+        location: FPathBuf,
+        mut primary: Box<dyn VirtualFile>,
+        findings: &mut Vec<Finding>,
+    ) -> ForensicResult<Self> {
+        let base_block = read_base_block(&mut primary, findings)?;
         primary.seek(std::io::SeekFrom::Start(HIVE_BASE_BLOCK_SIZE))?;
         let (_hive_bin, data) = read_hive_bin_at_file_position(&mut primary)?;
-        let cells = read_cells(&data, ROOT_CELL_OFFSET)?;
+        let cells = read_cells(&data, ROOT_CELL_OFFSET, findings)?;
         let mut cell_cache = CellCache::new(2048);
         for cell in cells {
             cell_cache.insert_fixed(cell);
@@ -858,7 +1079,7 @@ impl HiveFiles {
                 return Err(ForensicError::registry_hive_error(
                     "hive_root_cell",
                     "expected root cell of type KeyNode",
-                ))
+                ));
             }
         };
         Ok(Self {
@@ -866,46 +1087,367 @@ impl HiveFiles {
             base_block,
             primary,
             root_cell,
-            logs: Vec::with_capacity(8),
             cell_cache,
             buffer: vec![0u8; HIVE_BASE_BLOCK_SIZE as usize],
             mounted: MountedMap::new(),
+            mounted_keys: BTreeMap::new(),
+            mounted_key_counter: 0,
+            real_key_paths: BTreeMap::from([(ROOT_CELL_OFFSET, String::new())]),
+            patched_bins: None,
+            recovered_sequence: None,
         })
+    }
+
+    /// Like [Self::new_with_logs], but for callers that don't need the integrity findings
+    /// collected during the parse and replay.
+    pub fn new_with_logs(
+        location: FPathBuf,
+        primary: Box<dyn VirtualFile>,
+        log1: Option<Box<dyn VirtualFile>>,
+        log2: Option<Box<dyn VirtualFile>>,
+    ) -> ForensicResult<Self> {
+        Self::new_with_logs_and_findings(location, primary, log1, log2, &mut Vec::new())
+    }
+
+    /// Like [Self::new_with_findings], but additionally attempts transaction-log replay
+    /// (`.LOG1`/`.LOG2`, new format) if the primary hive is dirty (`prim_sequence != sec_sequence`)
+    /// and at least one of `log1`/`log2` is available. Clean hives, and dirty hives with no usable
+    /// log, pay zero extra cost — [Self::patched_bins] stays `None` and [Self::get_cell_at_offset]
+    /// behaves exactly as [Self::new_with_findings]'s result would. Never fails just because
+    /// recovery didn't help: any read/parse error while replaying is logged via `warn!` — and, when
+    /// it means reads may reflect stale/unpatched bytes, also recorded as an `IntegrityIssue`
+    /// [Finding] in `findings` — and the hive still opens with its original, unpatched bytes.
+    pub fn new_with_logs_and_findings(
+        location: FPathBuf,
+        primary: Box<dyn VirtualFile>,
+        log1: Option<Box<dyn VirtualFile>>,
+        log2: Option<Box<dyn VirtualFile>>,
+        findings: &mut Vec<Finding>,
+    ) -> ForensicResult<Self> {
+        let mut hive = Self::new_with_findings(location, primary, findings)?;
+        if hive.base_block.prim_sequence == hive.base_block.sec_sequence {
+            return Ok(hive);
+        }
+        // Bound the eventual replay-buffer allocation against the primary file's actual size
+        // before trusting `hive_bins_data_size` (an unvalidated u32 read straight from evidence)
+        // as an allocation length — a hostile few-KiB file could otherwise claim a
+        // multi-gigabyte hive-bins-data size and force an unbounded allocation. Checked up front
+        // (rather than only right before the allocation) so an implausible header value is
+        // reported the same way regardless of whether any log files happen to be available.
+        let declared_size = hive.base_block.hive_bins_data_size as u64;
+        let file_size = hive.primary.metadata().map(|m| m.len()).unwrap_or(u64::MAX);
+        if declared_size > file_size {
+            warn!(
+                "Hive at {} declares hive_bins_data_size={} larger than the file itself ({} bytes); opening with unpatched bytes",
+                hive.location, declared_size, file_size
+            );
+            findings.push(
+                Finding::new(
+                    FindingSeverity::High,
+                    FindingCategory::IntegrityIssue,
+                    "Implausible hive_bins_data_size in base block",
+                )
+                .with_description(format!(
+                    "Hive at {} declares a hive_bins_data_size of {declared_size} bytes, larger \
+                     than the primary file itself ({file_size} bytes); this is inconsistent with \
+                     a genuine hive and log replay was skipped to avoid an unbounded allocation.",
+                    hive.location
+                )),
+            );
+            return Ok(hive);
+        }
+        // Deliberately does NOT short-circuit on `log1.is_none() && log2.is_none()` — a dirty
+        // hive opened with no logs at all is exactly the same forensic concern (stale/unpatched
+        // reads) as one opened with logs that don't cover the gap, and must fall through to the
+        // same `to_apply.is_empty()` Finding below rather than returning silently.
+        let read_log = |f: Option<Box<dyn VirtualFile>>, name: &str, findings: &mut Vec<Finding>| match f {
+            Some(mut file) => read_log_entries(&mut file, findings).unwrap_or_else(|e| {
+                warn!("Error reading {name}: {:?}", e);
+                findings.push(Finding::from_error(format!("reading {name}"), &e));
+                Vec::new()
+            }),
+            None => Vec::new(),
+        };
+        let entries1 = read_log(log1, ".LOG1", findings);
+        let entries2 = read_log(log2, ".LOG2", findings);
+        let to_apply = select_entries_to_apply(hive.base_block.prim_sequence, &entries1, &entries2);
+        if to_apply.is_empty() {
+            warn!(
+                "Hive at {} is dirty (sequence {} != {}) but no log entries cover the gap; opening with unpatched bytes",
+                hive.location, hive.base_block.prim_sequence, hive.base_block.sec_sequence
+            );
+            findings.push(
+                Finding::new(
+                    FindingSeverity::High,
+                    FindingCategory::IntegrityIssue,
+                    "Dirty hive opened without log replay",
+                )
+                .with_description(format!(
+                    "Hive at {} is dirty (primary sequence {} != secondary sequence {}) but no \
+                     available .LOG1/.LOG2 entries cover the gap; it was opened using its \
+                     original, unpatched bytes, so reads may reflect stale/pre-crash state.",
+                    hive.location, hive.base_block.prim_sequence, hive.base_block.sec_sequence
+                )),
+            );
+            return Ok(hive);
+        }
+        let mut bins = vec![0u8; declared_size as usize];
+        if let Err(e) = hive
+            .primary
+            .seek(std::io::SeekFrom::Start(HIVE_BASE_BLOCK_SIZE))
+            .and_then(|_| hive.primary.read_exact(&mut bins))
+        {
+            warn!("Error reading hive-bins-data for log replay: {:?}", e);
+            findings.push(Finding::from_error(
+                "reading hive-bins-data for log replay",
+                &ForensicError::io_error_with_source(e, "hive-bins-data read for log replay"),
+            ));
+            return Ok(hive);
+        }
+        let Some(last_applied) = apply_entries(&mut bins, &to_apply, findings) else {
+            warn!(
+                "No log entries applied cleanly for hive at {}; opening with unpatched bytes",
+                hive.location
+            );
+            findings.push(
+                Finding::new(
+                    FindingSeverity::High,
+                    FindingCategory::IntegrityIssue,
+                    "No transaction log entries applied cleanly",
+                )
+                .with_description(format!(
+                    "Hive at {} is dirty, log entries were available, but none applied cleanly; \
+                     it was opened using its original, unpatched bytes, so reads may reflect \
+                     stale/pre-crash state.",
+                    hive.location
+                )),
+            );
+            return Ok(hive);
+        };
+
+        hive.base_block.prim_sequence = last_applied;
+        hive.base_block.sec_sequence = last_applied;
+        hive.base_block.hive_bins_data_size = bins.len() as u32;
+        hive.cell_cache = CellCache::new(2048);
+        hive.patched_bins = Some(bins);
+        hive.recovered_sequence = Some(last_applied);
+        let root_cell = match hive.get_cell_at_offset(hive.base_block.root_cell_offset as u64)? {
+            HiveCell::KeyNode(v) => v.clone(),
+            _ => {
+                return Err(ForensicError::registry_hive_error(
+                    "hive_root_cell",
+                    "expected root cell of type KeyNode after log replay",
+                ));
+            }
+        };
+        hive.root_cell = root_cell;
+        Ok(hive)
+    }
+
+    /// The sequence number log replay recovered up to, if [Self::new_with_logs] applied at least
+    /// one log entry (`None` for a clean hive, a hive opened without logs, or one where no log
+    /// entry covered the dirty gap — all of which leave the original on-disk bytes untouched).
+    pub fn log_recovery_applied(&self) -> Option<u32> {
+        self.recovered_sequence
     }
 
     pub fn scan_hive(_primary: &mut Box<dyn VirtualFile>) -> Vec<(u64, u64)> {
         vec![]
     }
+    /// Adds a REG-injected value mounted underneath this hive. `path` must be hive-relative (see
+    /// the [Self::mounted] field doc) — the caller (`HiveRegistryReader::add_reg_key`) is
+    /// responsible for stripping the `HKEY_LOCAL_MACHINE\<HIVE>\`/`HKEY_USERS\<guid>\` prefix
+    /// before calling this, matching the same stripping `open_under_lm`/`open_under_users` apply
+    /// on the read side (SOFTWARE strips its own `SOFTWARE\` segment, user hives strip the user's
+    /// GUID) — a mismatch here means a mounted value can be stored but never found again.
     pub fn add_mounted_value(&mut self, path: &str, value: &str, data: RegValue) {
         self.mounted.add_value(path, value, data);
     }
 
-    pub fn open_mounted_key(&mut self, _key_name: &str, _key_id: i64) -> ForensicResult<isize> {
-        Err(not_implemented("HiveFiles::open_mounted_key"))
+    fn next_mounted_id(&mut self) -> u64 {
+        loop {
+            let candidate = self.mounted_key_counter;
+            self.mounted_key_counter = self.mounted_key_counter.wrapping_add(1);
+            if !self.mounted_keys.contains_key(&candidate) {
+                return candidate;
+            }
+        }
     }
 
-    pub fn open_key_from_offset(&mut self, key_name: &str, offset: i64) -> ForensicResult<isize> {
-        if offset < 0 {
-            return self.open_mounted_key(key_name, offset);
+    /// Resolves `key_name` (hive-relative, same convention as [Self::mounted]) against this
+    /// hive's mounted map, minting a fresh [HiveOffset::Mounted] id on success. Used both as the
+    /// fallback when [Self::open_key_from_offset]'s real-tree walk fails, and directly when the
+    /// parent key is already known to be mounted (see [Self::open_mounted_child]).
+    pub fn open_mounted_key(&mut self, key_name: &str) -> ForensicResult<HiveOffset> {
+        if !self.mounted.contains(key_name) {
+            return Err(ForensicError::registry_key_not_found(
+                PredefinedHive::LocalMachine,
+                Some(key_name.into()),
+            ));
         }
-        let offset = offset as u64;
+        let id = self.next_mounted_id();
+        self.mounted_keys.insert(id, key_name.to_string());
+        Ok(HiveOffset::Mounted(id))
+    }
+
+    /// Resolves a [HiveOffset::Mounted] id to its [MountedCell], for value/key enumeration.
+    fn mounted_cell(&self, id: u64) -> ForensicResult<Option<&MountedCell>> {
+        let path = self
+            .mounted_keys
+            .get(&id)
+            .ok_or_else(|| ForensicError::registry_invalid_handle(id as i64))?;
+        Ok(self.mounted.get_cell(path))
+    }
+
+    /// Opens `name` as a child of an already-open mounted key `parent_id` — i.e. a mounted key
+    /// nested underneath another mounted key, both underneath this real hive. Skips the real
+    /// on-disk tree entirely, since the parent is already known not to be a real cell.
+    pub fn open_mounted_child(&mut self, parent_id: u64, name: &str) -> ForensicResult<HiveOffset> {
+        let parent_path = self
+            .mounted_keys
+            .get(&parent_id)
+            .ok_or_else(|| ForensicError::registry_invalid_handle(parent_id as i64))?;
+        let child_path = format!("{parent_path}\\{name}");
+        self.open_mounted_key(&child_path)
+    }
+
+    /// Opens `key_name` relative to the real on-disk cell at `offset`. On success returns
+    /// [HiveOffset::Real] and records the resolved path in [Self::real_key_paths] (so a later
+    /// enumeration of that key can merge in mounted overlays, see [Self::merge_mounted_children]/
+    /// [Self::merge_mounted_values]). On any failure, retries the *whole* `key_name` against this
+    /// hive's [Self::mounted] map (see [Self::open_mounted_key]) and returns [HiveOffset::Mounted]
+    /// if found there instead — preserving the original real-tree error if the mounted retry also
+    /// fails. This covers "real path prefix, then a fully-mounted subtree" (the natural shape for
+    /// injecting a synthetic subtree) but not real/mounted children interleaved at every level of
+    /// one multi-segment path. `real_key_paths` only knows offsets reached through a path-based
+    /// open (via this function or [Self::record_real_path]'s callers) — an offset only ever
+    /// reached directly (bypassing name-based lookup) won't have mounted overlays merged.
+    pub fn open_key_from_offset(&mut self, key_name: &str, offset: i64) -> ForensicResult<HiveOffset> {
+        let base_offset = offset as u64;
+        match self.open_key_from_offset_real(key_name, base_offset) {
+            Ok(real_offset) => {
+                self.record_real_path(base_offset, key_name, real_offset);
+                Ok(HiveOffset::Real(real_offset))
+            }
+            Err(e) => self.open_mounted_key(key_name).map_err(|_| e),
+        }
+    }
+
+    /// Like [`open_key_from_offset`], but opens `key_name` as a single literal child — see
+    /// [`open_child_key_from_offset_real`].
+    pub fn open_child_key_from_offset(&mut self, key_name: &str, offset: i64) -> ForensicResult<HiveOffset> {
+        let base_offset = offset as u64;
+        match self.open_child_key_from_offset_real(key_name, base_offset) {
+            Ok(real_offset) => {
+                self.record_real_path(base_offset, key_name, real_offset);
+                Ok(HiveOffset::Real(real_offset))
+            }
+            Err(e) => self.open_mounted_key(key_name).map_err(|_| e),
+        }
+    }
+
+    /// Records that `result_offset` (the outcome of resolving `key_name` relative to
+    /// `base_offset`) corresponds to the hive-relative path `real_key_paths[base_offset] +
+    /// key_name`, if `base_offset`'s own path is already known (a no-op otherwise — degrades
+    /// gracefully rather than guessing). A no-op for an empty `key_name` (root re-open), since
+    /// `result_offset == base_offset` then and there's nothing new to record.
+    fn record_real_path(&mut self, base_offset: u64, key_name: &str, result_offset: u64) {
+        if key_name.is_empty() {
+            return;
+        }
+        let Some(base_path) = self.real_key_paths.get(&base_offset) else {
+            return;
+        };
+        let full_path = if base_path.is_empty() {
+            key_name.to_string()
+        } else {
+            format!("{base_path}\\{key_name}")
+        };
+        self.real_key_paths.insert(result_offset, full_path);
+    }
+
+    /// If `offset` was reached through a path-based open, appends any children mounted directly
+    /// under that same path (see [Self::real_key_paths]) to `keys` — real subkeys always take
+    /// precedence, so a mounted name that collides with an already-listed real subkey is skipped.
+    fn merge_mounted_children(&self, offset: u64, keys: &mut Vec<KeyEntry>) {
+        let Some(path) = self.real_key_paths.get(&offset) else {
+            return;
+        };
+        let Some(cell) = self.mounted.get_cell(path) else {
+            return;
+        };
+        for entry in mounted_cell_keys(cell) {
+            if !keys.iter().any(|k| k.name == entry.name) {
+                keys.push(entry);
+            }
+        }
+    }
+
+    /// If `offset` was reached through a path-based open, appends any values mounted directly
+    /// under that same path to `values` — real values always take precedence over a same-named
+    /// mounted value.
+    fn merge_mounted_values(&self, offset: u64, values: &mut Vec<(String, RegValue)>) {
+        let Some(path) = self.real_key_paths.get(&offset) else {
+            return;
+        };
+        let Some(cell) = self.mounted.get_cell(path) else {
+            return;
+        };
+        for entry in mounted_cell_values(cell) {
+            if !values.iter().any(|(name, _)| *name == entry.0) {
+                values.push(entry);
+            }
+        }
+    }
+
+    fn open_key_from_offset_real(&mut self, key_name: &str, offset: u64) -> ForensicResult<u64> {
         if offset == ROOT_CELL_OFFSET && key_name.is_empty() {
-            return Ok(ROOT_CELL_OFFSET as isize);
+            return Ok(ROOT_CELL_OFFSET);
         }
-        let mut path_separator = key_name.split(['/', '\\']);
+        self.resolve_path_from_offset(key_name.split(['/', '\\']), offset)
+    }
+
+    /// Like [`open_key_from_offset_real`], but treats `key_name` as a single literal child name,
+    /// never split into path segments — even one containing `/` or `\`. Needed for registry data
+    /// (e.g. AmCache's `InventoryDriverBinary`) whose enumerated child names are themselves full
+    /// file paths, not a hierarchy to descend. See [`Registry::open_child_raw`] for the public
+    /// contract this backs.
+    fn open_child_key_from_offset_real(&mut self, key_name: &str, offset: u64) -> ForensicResult<u64> {
+        if offset == ROOT_CELL_OFFSET && key_name.is_empty() {
+            return Ok(ROOT_CELL_OFFSET);
+        }
+        self.resolve_path_from_offset(std::iter::once(key_name), offset)
+    }
+
+    /// Shared walk behind [`open_key_from_offset_real`] and
+    /// [`open_child_key_from_offset_real`] — descends one hive level per item `path_separator`
+    /// yields, so the two callers differ only in whether `key_name` is pre-split into segments or
+    /// passed through as a single segment.
+    fn resolve_path_from_offset<'a>(
+        &mut self,
+        mut path_separator: impl Iterator<Item = &'a str>,
+        offset: u64,
+    ) -> ForensicResult<u64> {
         let root_cell = match self.get_cell_at_offset(offset)? {
             HiveCell::KeyNode(kn) => kn,
-            _ => return Err(ForensicError::registry_cell_structure_error("key_node", offset, "KeyNode")),
+            _ => {
+                return Err(ForensicError::registry_cell_structure_error(
+                    "key_node", offset, "KeyNode",
+                ));
+            }
         };
         let subkeys_offset = root_cell.subkeys_list_offset;
         let n_subkeys = root_cell.number_subkeys;
         let _n_key_val = root_cell.number_key_values;
         let first = match path_separator.next() {
             Some(v) => v,
-            None => return Ok(ROOT_CELL_OFFSET as isize), // Root Cell
+            None => return Ok(ROOT_CELL_OFFSET), // Root Cell
         };
         if n_subkeys == 0 {
-            return Err(ForensicError::registry_key_not_found(PredefinedHive::LocalMachine, Some(first.into())));
+            return Err(ForensicError::registry_key_not_found(
+                PredefinedHive::LocalMachine,
+                Some(first.into()),
+            ));
         }
         let mut next_offset = subkeys_offset;
         let mut subkey_last_index = 0;
@@ -929,7 +1471,7 @@ impl HiveFiles {
                             return Err(ForensicError::registry_key_not_found(
                                 PredefinedHive::LocalMachine,
                                 Some(actual_path.into()),
-                            ))
+                            ));
                         }
                     };
                     next_offset = last_offset;
@@ -949,7 +1491,7 @@ impl HiveFiles {
                                 return Err(ForensicError::registry_key_not_found(
                                     PredefinedHive::LocalMachine,
                                     Some(actual_path.into()),
-                                ))
+                                ));
                             }
                         };
                         next_offset = last_offset;
@@ -981,7 +1523,7 @@ impl HiveFiles {
                             return Err(ForensicError::registry_key_not_found(
                                 PredefinedHive::LocalMachine,
                                 Some(actual_path.into()),
-                            ))
+                            ));
                         }
                     };
                     next_offset = last_offset;
@@ -1001,7 +1543,7 @@ impl HiveFiles {
                             return Err(ForensicError::registry_key_not_found(
                                 PredefinedHive::LocalMachine,
                                 Some(actual_path.into()),
-                            ))
+                            ));
                         }
                     };
                     next_offset = last_offset;
@@ -1021,7 +1563,7 @@ impl HiveFiles {
                             return Err(ForensicError::registry_key_not_found(
                                 PredefinedHive::LocalMachine,
                                 Some(actual_path.into()),
-                            ))
+                            ));
                         }
                     };
                     next_offset = last_offset;
@@ -1031,13 +1573,13 @@ impl HiveFiles {
                     return Err(ForensicError::registry_key_not_found(
                         PredefinedHive::LocalMachine,
                         Some(actual_path.into()),
-                    ))
+                    ));
                 }
             };
         }
-        Ok(next_offset as isize)
+        Ok(next_offset as u64)
     }
-    pub fn open_key(&mut self, key_name: &str) -> ForensicResult<isize> {
+    pub fn open_key(&mut self, key_name: &str) -> ForensicResult<HiveOffset> {
         self.open_key_from_offset(key_name, ROOT_CELL_OFFSET as i64)
     }
 
@@ -1049,7 +1591,12 @@ impl HiveFiles {
 
         let kn = match cell {
             HiveCell::KeyNode(ir) => ir,
-            _ => return Err(ForensicError::registry_hive_error("hive_root_cell", "invalid root cell type")),
+            _ => {
+                return Err(ForensicError::registry_hive_error(
+                    "hive_root_cell",
+                    "invalid root cell type",
+                ));
+            }
         };
         Ok(kn)
     }
@@ -1057,19 +1604,25 @@ impl HiveFiles {
         if self.cell_cache.contains(offset) {
             return Ok(self.cell_cache.get(offset).unwrap());
         }
-        self.primary.seek(std::io::SeekFrom::Start(
-            self.hive_bins_data_offset() + offset,
-        ))?;
+        if let Some(bins) = self.patched_bins.as_ref() {
+            let start = offset as usize;
+            let slice = bins.get(start..).ok_or_else(|| {
+                ForensicError::registry_cell_error("cell", format!("offset {offset} beyond patched hive-bins-data"))
+            })?;
+            let cell = read_cell(slice, offset)?;
+            self.cell_cache.insert(cell);
+            return self.cached_cell_or_missing(offset);
+        }
+        self.primary
+            .seek(std::io::SeekFrom::Start(self.hive_bins_data_offset() + offset))?;
         let mut readed = self.primary.read(&mut self.buffer)?;
         let cell_size = peek_cell(&self.buffer[0..readed]);
         if cell_size > readed {
-            if cell_size
-                > self
-                    .base_block
-                    .hive_bins_data_size
-                    .try_into()
-                    .unwrap_or_default()
-            {
+            // `u32 as usize` never truncates on any platform this crate targets (usize is at
+            // least 32 bits) — unlike `try_into().unwrap_or_default()`, it can't silently
+            // collapse a legitimate `hive_bins_data_size` down to 0 and make every cell look
+            // oversized.
+            if cell_size > self.base_block.hive_bins_data_size as usize {
                 return Err(ForensicError::registry_cell_error(
                     "cell",
                     format!("invalid cell size {cell_size} at offset {offset}"),
@@ -1078,14 +1631,17 @@ impl HiveFiles {
             if cell_size > self.buffer.len() {
                 self.buffer = vec![0; ((cell_size / 1024) + 1) * 1024];
             }
-            self.primary.seek(std::io::SeekFrom::Start(
-                self.hive_bins_data_offset() + offset,
-            ))?;
+            self.primary
+                .seek(std::io::SeekFrom::Start(self.hive_bins_data_offset() + offset))?;
             self.primary.read_exact(&mut self.buffer[0..cell_size])?;
             readed = cell_size;
         }
         let cell = read_cell(&self.buffer[0..readed], offset)?;
         self.cell_cache.insert(cell);
+        self.cached_cell_or_missing(offset)
+    }
+
+    fn cached_cell_or_missing(&self, offset: u64) -> ForensicResult<&HiveCell> {
         match self.cell_cache.get(offset) {
             Some(cell) => Ok(cell),
             None => Err(ForensicError::missing_data("hive_cell", "Hive cell not found".into())),
@@ -1094,9 +1650,40 @@ impl HiveFiles {
     fn hive_bins_data_offset(&self) -> u64 {
         HIVE_BASE_BLOCK_SIZE
     }
+
+    /// Returns the full hive-bins-data region as an owned buffer: [Self::patched_bins] if log
+    /// replay populated it, otherwise a fresh read from [Self::primary]. Used by
+    /// [crate::recovery]'s unallocated-cell walk, which needs to scan contiguous raw bytes rather
+    /// than the cell-by-cell, cache-backed access [Self::get_cell_at_offset] provides. Bounds the
+    /// read against the primary file's actual size first, same rationale as the log-replay
+    /// allocation guard in [Self::new_with_logs_and_findings].
+    pub(crate) fn hive_bins_data(&mut self) -> ForensicResult<Vec<u8>> {
+        if let Some(bins) = &self.patched_bins {
+            return Ok(bins.clone());
+        }
+        let declared_size = self.base_block.hive_bins_data_size as u64;
+        let file_size = self.primary.metadata().map(|m| m.len()).unwrap_or(u64::MAX);
+        if declared_size > file_size {
+            return Err(ForensicError::registry_hive_error(
+                "hive_bins_data",
+                format!(
+                    "declared hive_bins_data_size={declared_size} exceeds the file's actual size ({file_size} bytes)"
+                ),
+            ));
+        }
+        let mut bins = vec![0u8; declared_size as usize];
+        self.primary.seek(std::io::SeekFrom::Start(HIVE_BASE_BLOCK_SIZE))?;
+        self.primary.read_exact(&mut bins)?;
+        Ok(bins)
+    }
 }
 
 impl Registry for HiveRegistryReader {
+    /// Deleted-key/value carving is implemented — see [RecoverDeleted for HiveRegistryReader].
+    fn as_recovery(&self) -> Option<&dyn RecoverDeleted> {
+        Some(self)
+    }
+
     fn root(&self, hive: PredefinedHive) -> ForensicResult<RawKey> {
         match hive {
             PredefinedHive::LocalMachine => Ok(pack_raw_key(HiveKind::LmRoot, 0)),
@@ -1105,7 +1692,10 @@ impl Registry for HiveRegistryReader {
                 if self.current_config.is_some() {
                     Ok(pack_raw_key(HiveKind::CurrentConfig, ROOT_CELL_OFFSET))
                 } else {
-                    Err(ForensicError::registry_key_not_found(PredefinedHive::CurrentConfig, None))
+                    Err(ForensicError::registry_key_not_found(
+                        PredefinedHive::CurrentConfig,
+                        None,
+                    ))
                 }
             }
             other => Err(ForensicError::registry_key_not_found(other, None)),
@@ -1117,19 +1707,76 @@ impl Registry for HiveRegistryReader {
         match kind {
             HiveKind::LmRoot => self.open_under_lm(name),
             HiveKind::UsersRoot => self.open_under_users(name),
-            HiveKind::Cached => Err(not_implemented("Opening keys inside a mounted hive")),
+            HiveKind::Cached => {
+                self.require_cached_key(payload)?;
+                let cached_keys = self.cached_keys.lock().unwrap();
+                let parent_path = cached_keys
+                    .get(&payload)
+                    .ok_or_else(|| ForensicError::registry_invalid_handle(payload as i64))?
+                    .clone();
+                drop(cached_keys);
+                let child_path = format!("{parent_path}\\{name}");
+                let is_mounted = self.mounted.lock().unwrap().contains(&child_path);
+                if !is_mounted {
+                    return Err(ForensicError::registry_key_not_found(
+                        PredefinedHive::LocalMachine,
+                        Some(name.into()),
+                    ));
+                }
+                let id = self.next_cached_id();
+                self.cached_keys.lock().unwrap().insert(id, child_path);
+                Ok(pack_raw_key(HiveKind::Cached, id))
+            }
             real_kind => {
                 let hive = self.hive_for_kind(real_kind)?;
                 let mut h = try_lock_hive(hive)?;
-                let offset = h.open_key_from_offset(name, payload as i64)?;
-                Ok(pack_raw_key(real_kind, offset as u64))
+                let child = match HiveOffset::from_payload(payload) {
+                    HiveOffset::Real(offset) => h.open_key_from_offset(name, offset as i64)?,
+                    HiveOffset::Mounted(id) => h.open_mounted_child(id, name)?,
+                };
+                Ok(pack_raw_key(real_kind, child.to_payload()))
+            }
+        }
+    }
+
+    /// Overrides the default (which would delegate to [`Self::open_raw`] and re-split `name`):
+    /// only the real-hive-tree branch actually needs single-literal-child semantics — HKLM/HKU's
+    /// synthetic roots and the REG-injected `Cached` overlay have no equivalent "flat name with
+    /// embedded separators" case, so they fall back to [`Self::open_raw`] unchanged.
+    fn open_child_raw(&self, parent: &RawKey, name: &str) -> ForensicResult<RawKey> {
+        let (kind, payload) = unpack_raw_key(parent)?;
+        match kind {
+            HiveKind::LmRoot | HiveKind::UsersRoot | HiveKind::Cached => self.open_raw(parent, name),
+            real_kind => {
+                let hive = self.hive_for_kind(real_kind)?;
+                let mut h = try_lock_hive(hive)?;
+                let child = match HiveOffset::from_payload(payload) {
+                    HiveOffset::Real(offset) => h.open_child_key_from_offset(name, offset as i64)?,
+                    HiveOffset::Mounted(id) => h.open_mounted_child(id, name)?,
+                };
+                Ok(pack_raw_key(real_kind, child.to_payload()))
             }
         }
     }
 
     fn close_raw(&self, key: &RawKey) {
-        if let Ok((HiveKind::Cached, payload)) = unpack_raw_key(key) {
-            self.cached_keys.lock().unwrap().remove(&payload);
+        let Ok((kind, payload)) = unpack_raw_key(key) else {
+            return;
+        };
+        match kind {
+            HiveKind::Cached => {
+                self.cached_keys.lock().unwrap().remove(&payload);
+            }
+            HiveKind::LmRoot | HiveKind::UsersRoot => {}
+            real_kind => {
+                if let HiveOffset::Mounted(id) = HiveOffset::from_payload(payload) {
+                    if let Ok(hive) = self.hive_for_kind(real_kind) {
+                        if let Ok(mut h) = try_lock_hive(hive) {
+                            h.mounted_keys.remove(&id);
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -1159,7 +1806,23 @@ impl Registry for HiveRegistryReader {
             real_kind => {
                 let hive = self.hive_for_kind(real_kind)?;
                 let mut h = try_lock_hive(hive)?;
-                read_value_from_hive(&mut h, payload, value_name)
+                match HiveOffset::from_payload(payload) {
+                    HiveOffset::Real(offset) => read_value_from_hive(&mut h, offset, value_name),
+                    HiveOffset::Mounted(id) => match h.mounted_cell(id)? {
+                        Some(cell) => cell
+                            .value_entries()
+                            .find(|(name, _)| *name == value_name)
+                            .map(|(_, v)| v.clone())
+                            .ok_or_else(|| {
+                                ForensicError::registry_value_not_found(PredefinedHive::LocalMachine, None, value_name)
+                            }),
+                        None => Err(ForensicError::registry_value_not_found(
+                            PredefinedHive::LocalMachine,
+                            None,
+                            value_name,
+                        )),
+                    },
+                }
             }
         }
     }
@@ -1170,12 +1833,18 @@ impl Registry for HiveRegistryReader {
             HiveKind::LmRoot | HiveKind::UsersRoot => Ok(Vec::new()),
             HiveKind::Cached => {
                 self.require_cached_key(payload)?;
-                Err(not_implemented("Enumerating values of a mounted hive key"))
+                Ok(self.cached_key_values(payload)?)
             }
             real_kind => {
                 let hive = self.hive_for_kind(real_kind)?;
                 let mut h = try_lock_hive(hive)?;
-                values_from_hive(&mut h, payload)
+                match HiveOffset::from_payload(payload) {
+                    HiveOffset::Real(offset) => values_from_hive(&mut h, offset),
+                    HiveOffset::Mounted(id) => Ok(match h.mounted_cell(id)? {
+                        Some(cell) => mounted_cell_values(cell),
+                        None => Vec::new(),
+                    }),
+                }
             }
         }
     }
@@ -1203,12 +1872,18 @@ impl Registry for HiveRegistryReader {
                 .collect()),
             HiveKind::Cached => {
                 self.require_cached_key(payload)?;
-                Err(not_implemented("Enumerating subkeys of a mounted hive key"))
+                Ok(self.cached_key_names(payload)?)
             }
             real_kind => {
                 let hive = self.hive_for_kind(real_kind)?;
                 let mut h = try_lock_hive(hive)?;
-                keys_from_hive(&mut h, payload)
+                match HiveOffset::from_payload(payload) {
+                    HiveOffset::Real(offset) => keys_from_hive(&mut h, offset),
+                    HiveOffset::Mounted(id) => Ok(match h.mounted_cell(id)? {
+                        Some(cell) => mounted_cell_keys(cell),
+                        None => Vec::new(),
+                    }),
+                }
             }
         }
     }
@@ -1218,7 +1893,16 @@ impl Registry for HiveRegistryReader {
         match kind {
             HiveKind::Cached => {
                 self.require_cached_key(payload)?;
-                Ok(KeyInfo::default())
+                let path = self.cached_key_path(payload)?;
+                let mounted = self.mounted.lock().unwrap();
+                Ok(match mounted.get_cell(&path) {
+                    Some(cell) => KeyInfo {
+                        subkeys: cell.key_names().count() as u32,
+                        values: cell.value_entries().count() as u32,
+                        ..Default::default()
+                    },
+                    None => KeyInfo::default(),
+                })
             }
             HiveKind::LmRoot => Ok(KeyInfo {
                 subkeys: self.list_hklm_keys()?.len() as u32,
@@ -1231,38 +1915,73 @@ impl Registry for HiveRegistryReader {
             real_kind => {
                 let hive = self.hive_for_kind(real_kind)?;
                 let mut h = try_lock_hive(hive)?;
-                let cell = h.get_cell_at_offset(payload)?;
-                let key_node = match cell {
-                    HiveCell::KeyNode(v) => v,
-                    _ => return Err(ForensicError::registry_cell_structure_error("key_node", payload, "KeyNode")),
-                };
-                Ok(KeyInfo {
-                    last_write_time: Some(ForensicTimestamp::from_win_filetime(key_node.last_written_timestamp)),
-                    max_subkey_name_length: key_node.largest_subkey_name_length as u32,
-                    max_value_length: key_node.largest_value_data_size,
-                    max_value_name_length: key_node.largest_value_name_length,
-                    subkeys: key_node.number_subkeys,
-                    values: key_node.number_key_values,
-                })
+                match HiveOffset::from_payload(payload) {
+                    HiveOffset::Real(offset) => {
+                        let cell = h.get_cell_at_offset(offset)?;
+                        let key_node = match cell {
+                            HiveCell::KeyNode(v) => v,
+                            _ => {
+                                return Err(ForensicError::registry_cell_structure_error(
+                                    "key_node", offset, "KeyNode",
+                                ));
+                            }
+                        };
+                        Ok(KeyInfo {
+                            last_write_time: Some(ForensicTimestamp::from_win_filetime(
+                                key_node.last_written_timestamp,
+                            )),
+                            max_subkey_name_length: key_node.largest_subkey_name_length as u32,
+                            max_value_length: key_node.largest_value_data_size,
+                            max_value_name_length: key_node.largest_value_name_length,
+                            subkeys: key_node.number_subkeys,
+                            values: key_node.number_key_values,
+                        })
+                    }
+                    HiveOffset::Mounted(id) => Ok(match h.mounted_cell(id)? {
+                        Some(cell) => KeyInfo {
+                            subkeys: cell.key_names().count() as u32,
+                            values: cell.value_entries().count() as u32,
+                            ..Default::default()
+                        },
+                        None => KeyInfo::default(),
+                    }),
+                }
             }
         }
     }
 
-    fn values_iter_raw<'a>(&'a self, key: &RawKey) -> ForensicResult<Box<dyn Iterator<Item = (String, RegValue)> + 'a>> {
+    fn values_iter_raw<'a>(
+        &'a self,
+        key: &RawKey,
+    ) -> ForensicResult<Box<dyn Iterator<Item = (String, RegValue)> + 'a>> {
         let (kind, payload) = unpack_raw_key(key)?;
         match kind {
             HiveKind::LmRoot | HiveKind::UsersRoot => Ok(Box::new(std::iter::empty())),
             HiveKind::Cached => {
                 self.require_cached_key(payload)?;
-                Err(not_implemented("Enumerating values of a mounted hive key"))
+                Ok(Box::new(self.cached_key_values(payload)?.into_iter()))
             }
             real_kind => {
                 let hive_cell = self.hive_for_kind(real_kind)?;
                 let mut hive = try_lock_hive(hive_cell)?;
-                let cell = hive.get_cell_at_offset(payload)?;
+                let offset = match HiveOffset::from_payload(payload) {
+                    HiveOffset::Real(offset) => offset,
+                    HiveOffset::Mounted(id) => {
+                        let values = match hive.mounted_cell(id)? {
+                            Some(cell) => mounted_cell_values(cell),
+                            None => Vec::new(),
+                        };
+                        return Ok(Box::new(values.into_iter()));
+                    }
+                };
+                let cell = hive.get_cell_at_offset(offset)?;
                 let key_node = match cell {
                     HiveCell::KeyNode(v) => v,
-                    _ => return Err(ForensicError::registry_cell_structure_error("key_node", payload, "KeyNode")),
+                    _ => {
+                        return Err(ForensicError::registry_cell_structure_error(
+                            "key_node", offset, "KeyNode",
+                        ));
+                    }
                 };
                 let key_values_list_offset = key_node.key_values_list_offset;
                 let number_key_values = key_node.number_key_values;
@@ -1285,10 +2004,24 @@ impl Registry for HiveRegistryReader {
             real_kind => {
                 let hive_cell = self.hive_for_kind(real_kind)?;
                 let mut hive = try_lock_hive(hive_cell)?;
-                let cell = hive.get_cell_at_offset(payload)?;
+                let offset = match HiveOffset::from_payload(payload) {
+                    HiveOffset::Real(offset) => offset,
+                    HiveOffset::Mounted(id) => {
+                        let keys = match hive.mounted_cell(id)? {
+                            Some(cell) => mounted_cell_keys(cell),
+                            None => Vec::new(),
+                        };
+                        return Ok(Box::new(keys.into_iter()));
+                    }
+                };
+                let cell = hive.get_cell_at_offset(offset)?;
                 let key_node = match cell {
                     HiveCell::KeyNode(v) => v,
-                    _ => return Err(ForensicError::registry_cell_structure_error("key_node", payload, "KeyNode")),
+                    _ => {
+                        return Err(ForensicError::registry_cell_structure_error(
+                            "key_node", offset, "KeyNode",
+                        ));
+                    }
                 };
                 let subkeys_list_offset = key_node.subkeys_list_offset;
                 let number_subkeys = key_node.number_subkeys;
@@ -1300,52 +2033,137 @@ impl Registry for HiveRegistryReader {
             }
         }
     }
-}
 
-/// Opens SAM/SECURITY/SOFTWARE/SYSTEM (and their user hives) from evidence, per
-/// [RegistryReaderFactory]. Shared by [HiveRegistryReader::from_fs] (which hardcodes the
-/// conventional `C:\Windows\System32\Config` path) and any pipeline that already knows where the
-/// hive-container directory lives.
-pub struct HiveRegistryReaderFactory;
+    /// Overrides the default (which delegates to [Registry::values_raw] and extends `out` from
+    /// the resulting `Vec`) to instead drive [Self::values_iter_raw] directly, avoiding that
+    /// intermediate allocation.
+    fn values_raw_into(&self, key: &RawKey, out: &mut Vec<(String, RegValue)>) -> ForensicResult<()> {
+        out.extend(self.values_iter_raw(key)?);
+        Ok(())
+    }
 
-impl RegistryReaderFactory for HiveRegistryReaderFactory {
-    fn open(&self, filesystem: Arc<dyn FileSystem>, path: &FPath) -> ForensicResult<Box<dyn Registry>> {
-        let mut reader = HiveRegistryReader::new();
-        if let Some(hive) = open_hive_with_logs(&filesystem, path, "SYSTEM") {
-            reader.set_system(hive);
-        }
-        if let Some(hive) = open_hive_with_logs(&filesystem, path, "SOFTWARE") {
-            reader.set_software(hive);
-        }
-        if let Some(hive) = open_hive_with_logs(&filesystem, path, "SECURITY") {
-            reader.set_security(hive);
-        }
-        if let Some(hive) = open_hive_with_logs(&filesystem, path, "SAM") {
-            reader.set_sam(hive);
-        }
-        if let Err(e) = reader.load_user_hives(&filesystem) {
-            warn!("Error loading user hives: {:?}", e);
-        }
-        Ok(Box::new(reader))
+    /// Like [Self::values_raw_into]; see its doc comment for the buffer-reuse rationale.
+    fn keys_raw_into(&self, key: &RawKey, out: &mut Vec<KeyEntry>) -> ForensicResult<()> {
+        out.extend(self.keys_iter_raw(key)?);
+        Ok(())
     }
 }
 
-pub fn open_hive_with_logs(fs: &Arc<dyn FileSystem>, base_path: &FPath, name: &str) -> Option<HiveFiles> {
+impl HiveRegistryReader {
+    /// Every currently-loaded hive paired with a human-readable label identifying it (used for
+    /// `warn!` context and as the [RecoveredKey::parent_hint]/[RecoveredValue::key_hint]
+    /// provenance placeholder — see [crate::recovery]'s module doc — not a real key path).
+    fn all_hives(&self) -> Vec<(String, &Mutex<HiveFiles>)> {
+        let mut all = Vec::new();
+        if let Some(h) = &self.sam {
+            all.push(("SAM".to_string(), h));
+        }
+        if let Some(h) = &self.security {
+            all.push(("SECURITY".to_string(), h));
+        }
+        if let Some(h) = &self.software {
+            all.push(("SOFTWARE".to_string(), h));
+        }
+        if let Some(h) = &self.system {
+            all.push(("SYSTEM".to_string(), h));
+        }
+        if let Some(h) = &self.current_config {
+            all.push(("CurrentConfig".to_string(), h));
+        }
+        for (sid, h) in &self.users {
+            all.push((format!("User:{sid}"), h));
+        }
+        for (mount_path, h) in &self.others {
+            all.push((format!("Other:{mount_path}"), h));
+        }
+        all
+    }
+}
+
+/// Deleted-key/value recovery, carving unallocated hive cells — see [crate::recovery]'s module
+/// doc comment for the validation applied and its known limitations. Aggregates across every
+/// currently-loaded hive (the trait itself takes no hive parameter); a hive this can't lock (e.g.
+/// concurrently borrowed by an in-progress read elsewhere) or that fails to scan is skipped with a
+/// `warn!`, not treated as a fatal error for the whole aggregate result — recovery is inherently
+/// best-effort, and one uncooperative hive shouldn't hide what every other hive still yielded.
+impl RecoverDeleted for HiveRegistryReader {
+    fn deleted_keys(&self) -> ForensicResult<Vec<RecoveredKey>> {
+        let mut all = Vec::new();
+        for (label, hive) in self.all_hives() {
+            let mut guard = match try_lock_hive(hive) {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!("Cannot lock hive {label} to scan for deleted keys: {:?}", e);
+                    continue;
+                }
+            };
+            match recovery::scan_deleted_keys(&mut guard) {
+                Ok(found) => all.extend(found.into_iter().map(|mut k| {
+                    if k.parent_hint.is_none() {
+                        k.parent_hint = Some(format!("<{label}>"));
+                    }
+                    k
+                })),
+                Err(e) => warn!("Error scanning hive {label} for deleted keys: {:?}", e),
+            }
+        }
+        Ok(all)
+    }
+
+    fn deleted_values(&self) -> ForensicResult<Vec<RecoveredValue>> {
+        let mut all = Vec::new();
+        for (label, hive) in self.all_hives() {
+            let mut guard = match try_lock_hive(hive) {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!("Cannot lock hive {label} to scan for deleted values: {:?}", e);
+                    continue;
+                }
+            };
+            match recovery::scan_deleted_values(&mut guard) {
+                Ok(found) => all.extend(found.into_iter().map(|mut v| {
+                    v.key_hint = Some(format!("<{label}>"));
+                    v
+                })),
+                Err(e) => warn!("Error scanning hive {label} for deleted values: {:?}", e),
+            }
+        }
+        Ok(all)
+    }
+}
+
+/// Opens `name` (plus any discoverable `.LOG1`/`.LOG2` companions) under `base_path` and parses
+/// it into a [HiveFiles]. Returns `None` both when the primary file simply doesn't exist (a
+/// routine, expected outcome — not every hive kind is present in every filesystem) and when it
+/// exists but fails to parse — but only the latter additionally records a `ProcessingError`
+/// [Finding] in `findings`, since a hive that was found but couldn't be read means evidence went
+/// unexamined, not merely evidence that was never there.
+pub fn open_hive_with_logs(
+    fs: &Arc<dyn FileSystem>,
+    base_path: &FPath,
+    name: &str,
+    findings: &mut Vec<Finding>,
+) -> Option<HiveFiles> {
     let primary_path = base_path.join(name);
     let primary = fs.open(primary_path.as_path()).ok()?;
-    let mut hive = HiveFiles::new(primary_path.clone(), primary).ok()?;
-    for i in 1..3 {
-        let log_i = base_path.join(format!("{name}.LOG{i}"));
+    let mut logs: [Option<Box<dyn VirtualFile>>; 2] = [None, None];
+    for (i, log) in logs.iter_mut().enumerate() {
+        let log_i = base_path.join(format!("{name}.LOG{}", i + 1));
         match fs.open(log_i.as_path()) {
-            Ok(v) => {
-                hive.logs.push(v);
-            }
-            Err(e) => {
-                debug!("Cannot open hive log {}: {:?}", log_i, e);
-            }
+            Ok(v) => *log = Some(v),
+            Err(e) => debug!("Cannot open hive log {}: {:?}", log_i, e),
         };
     }
-    Some(hive)
+    let [log1, log2] = logs;
+    let path_display = primary_path.to_string();
+    match HiveFiles::new_with_logs_and_findings(primary_path, primary, log1, log2, findings) {
+        Ok(hive) => Some(hive),
+        Err(e) => {
+            warn!("Cannot parse hive {}: {:?}", path_display, e);
+            findings.push(Finding::from_error(format!("parsing hive {path_display}"), &e));
+            None
+        }
+    }
 }
 
 #[cfg(test)]

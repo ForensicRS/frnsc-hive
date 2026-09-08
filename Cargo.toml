@@ -4,9 +4,10 @@ version = "0.14.0"
 authors = ["Samuel Garcés Marín <samuel.garces@protonmail.com>"]
 keywords = ["forensic", "windows", "parser", "registry", "cybersecurity"]
 categories = ["parsing"]
-description = "Implements RegistryReader from forensic-rs to access the windows registry from Hive files"
+description = "Implements the Registry trait from forensic-rs to access the Windows registry from Hive files"
 license = "MIT"
-edition = "2021"
+edition = "2024"
+rust-version = "1.85"
 repository = "https://github.com/ForensicRS/frnsc-hive"
 exclude = ["/artifacts"]
 
@@ -15,3 +16,23 @@ exclude = ["/artifacts"]
 
 [dependencies]
 forensic-rs = "0.14"
+
+[[example]]
+name = "load_hives_from_fs"
+path = "examples/load_hives_from_fs.rs"
+
+[[example]]
+name = "mounted_registry_keys"
+path = "examples/mounted_registry_keys.rs"
+
+[[example]]
+name = "format_factory_mount"
+path = "examples/format_factory_mount.rs"
+
+[[example]]
+name = "integrity_findings"
+path = "examples/integrity_findings.rs"
+
+[[example]]
+name = "carve_deleted_keys"
+path = "examples/carve_deleted_keys.rs"
