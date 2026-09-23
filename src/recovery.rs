@@ -180,26 +180,36 @@ fn decode_recovered_value(hive: &mut HiveFiles, kv: &KeyValueCell) -> RegValue {
 
 /// Carves every deleted key this hive's unallocated cells still hold plausible remains of. See
 /// this module's doc comment for the validation this applies and its known limitations.
-pub(crate) fn scan_deleted_keys(hive: &mut HiveFiles) -> ForensicResult<Vec<RecoveredKey>> {
+///
+/// Each result is wrapped in [`Recovered`] carrying the cell's own absolute hive-bins-data
+/// offset as `Locus::Hive { cell, value_index: 0 }` — `value_index` has no meaning for a key
+/// carved directly by free-space scanning (it isn't reached via any key's value-list
+/// enumeration), so `0` here is a placeholder, not a claim about a real zeroth value.
+pub(crate) fn scan_deleted_keys(hive: &mut HiveFiles) -> ForensicResult<Vec<Recovered<RecoveredKey>>> {
     let bins = hive.hive_bins_data()?;
     let mut candidates = Vec::new();
     for span in find_free_spans(&bins) {
-        for (_offset, cell) in carve_span(&bins, &span) {
+        for (offset, cell) in carve_span(&bins, &span) {
             if let HiveCell::KeyNode(kn) = cell {
                 if is_plausible_key_node(&kn) {
-                    candidates.push(kn);
+                    candidates.push((offset, kn));
                 }
             }
         }
     }
     drop(bins); // the parent-hint lookup below re-borrows `hive` mutably
     let mut recovered = Vec::with_capacity(candidates.len());
-    for kn in candidates {
-        recovered.push(RecoveredKey {
-            name: kn.key_name,
-            last_write: Some(ForensicTimestamp::from_win_filetime(kn.last_written_timestamp)),
-            parent_hint: resolve_parent_hint(hive, kn.parent),
-        });
+    for (offset, kn) in candidates {
+        let parent_hint = resolve_parent_hint(hive, kn.parent);
+        recovered.push(Recovered::new(
+            RecoveredKey {
+                name: kn.key_name,
+                last_write: Some(ForensicTimestamp::from_win_filetime(kn.last_written_timestamp)),
+                parent_hint,
+            },
+            Recovery::DeletedMetadata,
+            Locus::Hive { cell: offset as u32, value_index: 0 },
+        ));
     }
     Ok(recovered)
 }
@@ -207,27 +217,35 @@ pub(crate) fn scan_deleted_keys(hive: &mut HiveFiles) -> ForensicResult<Vec<Reco
 /// Carves every deleted value this hive's unallocated cells still hold plausible remains of. See
 /// this module's doc comment for the validation this applies and its known limitations —
 /// [RecoveredValue::key_hint] is always `None`.
-pub(crate) fn scan_deleted_values(hive: &mut HiveFiles) -> ForensicResult<Vec<RecoveredValue>> {
+///
+/// Same [`Recovered`]/[`Locus::Hive`] treatment as [`scan_deleted_keys`], and for the same
+/// reason: a value carved independently of any key's enumeration has no list position to report,
+/// so `value_index: 0` is a placeholder — the cell offset alone is this value's real address.
+pub(crate) fn scan_deleted_values(hive: &mut HiveFiles) -> ForensicResult<Vec<Recovered<RecoveredValue>>> {
     let bins = hive.hive_bins_data()?;
     let mut candidates = Vec::new();
     for span in find_free_spans(&bins) {
-        for (_offset, cell) in carve_span(&bins, &span) {
+        for (offset, cell) in carve_span(&bins, &span) {
             if let HiveCell::KeyValue(kv) = cell {
                 if is_plausible_key_value(&kv) {
-                    candidates.push(kv);
+                    candidates.push((offset, kv));
                 }
             }
         }
     }
     drop(bins); // the data-decode lookup below re-borrows `hive` mutably
     let mut recovered = Vec::with_capacity(candidates.len());
-    for kv in candidates {
+    for (offset, kv) in candidates {
         let value = decode_recovered_value(hive, &kv);
-        recovered.push(RecoveredValue {
-            key_hint: None,
-            name: kv.value_name,
-            value,
-        });
+        recovered.push(Recovered::new(
+            RecoveredValue {
+                key_hint: None,
+                name: kv.value_name,
+                value,
+            },
+            Recovery::DeletedMetadata,
+            Locus::Hive { cell: offset as u32, value_index: 0 },
+        ));
     }
     Ok(recovered)
 }

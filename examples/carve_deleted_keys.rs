@@ -118,9 +118,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("--- Synthetic hive (guaranteed to have one recoverable deleted key) ---");
     for key in recovery.deleted_keys()? {
+        // `Recovered` has no `Deref` on purpose — `.value()`/`.recovery()`/`.locus()` keep the
+        // recovery mode visible at every use site instead of it silently dropping out.
         println!(
-            "Recovered deleted key: name={:?} last_write={:?} parent_hint={:?}",
-            key.name, key.last_write, key.parent_hint
+            "Recovered deleted key: name={:?} last_write={:?} parent_hint={:?} recovery={:?} locus={:?}",
+            key.value().name,
+            key.value().last_write,
+            key.value().parent_hint,
+            key.recovery(),
+            key.locus(),
         );
     }
 

@@ -21,7 +21,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   filtering (structural parse, in-range `FILETIME`, sane counts/flags) guards against false
   positives — see `src/recovery.rs`'s module doc for the validation applied and its known
   limitations (`RecoveredValue::key_hint` is always `None`; `RecoveredKey::parent_hint` falls back
-  to a `<HIVE>` provenance placeholder when no live parent can be resolved).
+  to a `<HIVE>` provenance placeholder when no live parent can be resolved). Follows
+  `forensic-rs`'s `RecoverDeleted::deleted_keys()`/`deleted_values()` returning
+  `Recovered<RecoveredKey>`/`Recovered<RecoveredValue>`: every carved key/value now carries its own
+  `Recovery::DeletedMetadata` and a `Locus::Hive { cell, value_index }` naming the exact absolute
+  hive-bins-data offset `carve_span` found it at — a carved cell was previously indistinguishable
+  from a live read to any generic caller, which is exactly the false-confidence claim `Recovered`
+  exists to prevent. `value_index` is always `0` for a value carved independently of any key's
+  enumeration; there is no list position to report honestly.
 - `cell::UnallocatedCell::size`: the free cell's declared length, needed by the deleted-cell
   recovery scan (`UnallocatedCell::offset` alone wasn't enough to know how far to scan).
 - `Registry::values_raw_into`/`keys_raw_into` overrides, avoiding the intermediate `Vec` the default

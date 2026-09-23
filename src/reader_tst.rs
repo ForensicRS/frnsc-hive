@@ -885,10 +885,16 @@ fn recover_deleted_key_end_to_end_through_hive_registry_reader() {
         .as_recovery()
         .expect("HiveRegistryReader implements RecoverDeleted");
     let deleted = recovery.deleted_keys().unwrap();
-    let found = deleted.iter().find(|k| k.name == "RecoveredKeyName");
+    let found = deleted.iter().find(|k| k.value().name == "RecoveredKeyName");
     assert!(found.is_some(), "expected to recover RecoveredKeyName, got {deleted:?}");
+    let found = found.unwrap();
     // No live parent resolves for this synthetic key, so the hive-provenance placeholder applies.
-    assert_eq!(Some("<SAM>".to_string()), found.unwrap().parent_hint);
+    assert_eq!(Some("<SAM>".to_string()), found.value().parent_hint);
+    // A carved key is not a live read, and it must say so: an unlabelled recovery grades as
+    // trustworthy as an allocated read, which is exactly the false claim `Recovered` exists to
+    // prevent.
+    assert_eq!(found.recovery(), Recovery::DeletedMetadata);
+    assert!(matches!(found.locus(), Locus::Hive { .. }));
 }
 
 #[test]

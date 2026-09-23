@@ -2087,7 +2087,7 @@ impl HiveRegistryReader {
 /// `warn!`, not treated as a fatal error for the whole aggregate result — recovery is inherently
 /// best-effort, and one uncooperative hive shouldn't hide what every other hive still yielded.
 impl RecoverDeleted for HiveRegistryReader {
-    fn deleted_keys(&self) -> ForensicResult<Vec<RecoveredKey>> {
+    fn deleted_keys(&self) -> ForensicResult<Vec<Recovered<RecoveredKey>>> {
         let mut all = Vec::new();
         for (label, hive) in self.all_hives() {
             let mut guard = match try_lock_hive(hive) {
@@ -2098,11 +2098,16 @@ impl RecoverDeleted for HiveRegistryReader {
                 }
             };
             match recovery::scan_deleted_keys(&mut guard) {
-                Ok(found) => all.extend(found.into_iter().map(|mut k| {
-                    if k.parent_hint.is_none() {
-                        k.parent_hint = Some(format!("<{label}>"));
-                    }
-                    k
+                // `.map()` transforms the recovered value in place while carrying its
+                // `Recovery`/`Locus` through unchanged — `Recovered` has no `Deref`, so this is
+                // the sanctioned way to touch the inner value without dropping the recovery mode.
+                Ok(found) => all.extend(found.into_iter().map(|r| {
+                    r.map(|mut k| {
+                        if k.parent_hint.is_none() {
+                            k.parent_hint = Some(format!("<{label}>"));
+                        }
+                        k
+                    })
                 })),
                 Err(e) => warn!("Error scanning hive {label} for deleted keys: {:?}", e),
             }
@@ -2110,7 +2115,7 @@ impl RecoverDeleted for HiveRegistryReader {
         Ok(all)
     }
 
-    fn deleted_values(&self) -> ForensicResult<Vec<RecoveredValue>> {
+    fn deleted_values(&self) -> ForensicResult<Vec<Recovered<RecoveredValue>>> {
         let mut all = Vec::new();
         for (label, hive) in self.all_hives() {
             let mut guard = match try_lock_hive(hive) {
@@ -2121,9 +2126,11 @@ impl RecoverDeleted for HiveRegistryReader {
                 }
             };
             match recovery::scan_deleted_values(&mut guard) {
-                Ok(found) => all.extend(found.into_iter().map(|mut v| {
-                    v.key_hint = Some(format!("<{label}>"));
-                    v
+                Ok(found) => all.extend(found.into_iter().map(|r| {
+                    r.map(|mut v| {
+                        v.key_hint = Some(format!("<{label}>"));
+                        v
+                    })
                 })),
                 Err(e) => warn!("Error scanning hive {label} for deleted values: {:?}", e),
             }
