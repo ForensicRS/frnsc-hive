@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `HiveRegistryReader::load_from_fs`, returning the reader together with its integrity findings
+  (`from_fs` returns a `Box<dyn Registry>`, which hides them). When `C:\Windows\System32\Config`
+  holds no machine hive, it searches the whole filesystem by name
+  (`discovery::find_hives`: `SYSTEM`, `SOFTWARE`, `SAM`, `SECURITY`, `*NTUSER.DAT`,
+  `Amcache.hve`), so triage collections such as `CopiedFiles/registry/<user>_NTUSER.DAT` load.
+  Candidates must carry the `regf` magic, one whose header names another hive is rejected, and
+  duplicates (e.g. `RegBack`) are set aside with a finding. A user hive found by name is mapped to
+  its SID through `ProfileList` by profile folder; when nothing maps it, it is loaded under
+  `HKU\<label>` with a finding. A failure loading user hives is now a finding, not a `warn!`.
 - `HiveRegistryReader::findings`: accumulated `forensic_rs::pipeline::finding::Finding`s for
   analyst-relevant integrity signals (checksum mismatches, unreplayed dirty hives, skipped/malformed
   log entries, unparseable hives) that were previously only visible via `warn!` log lines.

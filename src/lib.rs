@@ -1,6 +1,7 @@
 pub mod cell;
 pub(crate) mod cell_cache;
 pub mod consts;
+pub mod discovery;
 pub mod factory;
 pub mod hive;
 pub mod log;

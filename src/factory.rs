@@ -38,12 +38,7 @@ impl HiveFormatFactory {
     /// decodes past the intended terminator into a string this factory then simply fails to
     /// recognize, falling back to [Self::mount]'s "other" branch.
     fn decode_file_name_hint(raw: &[u8; 64]) -> String {
-        let units: Vec<u16> = raw
-            .chunks_exact(2)
-            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
-            .collect();
-        let end = units.iter().position(|&u| u == 0).unwrap_or(units.len());
-        String::from_utf16_lossy(&units[..end])
+        crate::discovery::decode_hint(raw)
     }
 
     /// The plain filesystem path this hop resolves to, if `ctx`'s locator ends in one — the

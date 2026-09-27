@@ -100,6 +100,10 @@ impl Default for HiveRegistryReader {
 impl HiveRegistryReader {
     /// Loads all hives from the file system searching for its locations.
     /// It also search for the location of the hives of all the users using the SOFTWARE hive with the **ProfileList** key.
+    ///
+    /// The integrity findings gathered while loading (checksum mismatches, dirty hives, hives that
+    /// couldn't be parsed) stay on the reader, which this `Box<dyn Registry>` hides: use
+    /// [Self::load_from_fs] to keep them.
     /// ```
     /// use forensic_rs::prelude::*;
     /// use frnsc_hive::reader::HiveRegistryReader;
@@ -108,26 +112,118 @@ impl HiveRegistryReader {
     /// let reader = HiveRegistryReader::from_fs(fs).unwrap();
     /// ```
     pub fn from_fs(fs: Arc<dyn FileSystem>) -> ForensicResult<Box<dyn Registry>> {
-        let config_folder = FPath::new("C:\\Windows\\System32\\Config");
+        let (reader, findings) = Self::load_from_fs(&fs);
+        let reader = reader.unwrap_or_else(|| {
+            let empty = HiveRegistryReader::new();
+            empty.record_findings(findings);
+            empty
+        });
+        Ok(Box::new(reader))
+    }
+
+    /// Loads the machine hives and the users' `NTUSER.DAT`, returning the reader with every
+    /// integrity finding gathered on the way. `None` when no machine hive was found.
+    ///
+    /// Looks in `C:\Windows\System32\Config` first and finds user hives through `ProfileList`.
+    /// Only when that folder holds no machine hive does it search the whole filesystem by name
+    /// ([crate::discovery::find_hives]): a triage collection such as
+    /// `CopiedFiles/registry/SYSTEM` + `<user>_NTUSER.DAT`. A user hive found that way is mapped
+    /// to its SID through `ProfileList` by profile folder name; when nothing maps it, it is loaded
+    /// under `HKU\<label>` and a finding says its SID is unresolved.
+    pub fn load_from_fs(fs: &Arc<dyn FileSystem>) -> (Option<HiveRegistryReader>, Vec<Finding>) {
         let mut reader = HiveRegistryReader::new();
         let mut findings = Vec::new();
-        if let Some(hive) = open_hive_with_logs(&fs, config_folder, "SYSTEM", &mut findings) {
-            reader.set_system(hive);
+        let config_folder = FPath::new("C:\\Windows\\System32\\Config");
+        let mut any = false;
+        for name in crate::discovery::MACHINE_HIVES {
+            if let Some(hive) = open_hive_with_logs(fs, config_folder, name, &mut findings) {
+                reader.set_machine_hive(name, hive);
+                any = true;
+            }
         }
-        if let Some(hive) = open_hive_with_logs(&fs, config_folder, "SOFTWARE", &mut findings) {
-            reader.set_software(hive);
+        if any {
+            reader.record_findings(std::mem::take(&mut findings));
+            if let Err(e) = reader.load_user_hives(fs) {
+                reader.record_findings(vec![Finding::from_error("loading user hives", &e)]);
+            }
+            let all = reader.findings();
+            return (Some(reader), all);
         }
-        if let Some(hive) = open_hive_with_logs(&fs, config_folder, "SECURITY", &mut findings) {
-            reader.set_security(hive);
+
+        let found = crate::discovery::find_hives(fs.as_ref());
+        findings.extend(found.findings);
+        for e in &found.errors {
+            findings.push(Finding::from_error("searching for hives", e));
         }
-        if let Some(hive) = open_hive_with_logs(&fs, config_folder, "SAM", &mut findings) {
-            reader.set_sam(hive);
+        for (name, path) in &found.machine {
+            let (dir, file) = split(path.as_path());
+            if let Some(hive) = open_hive_with_logs(fs, dir, file, &mut findings) {
+                reader.set_machine_hive(name, hive);
+                any = true;
+            }
+        }
+        if !any {
+            return (None, findings);
         }
         reader.record_findings(findings);
-        if let Err(e) = reader.load_user_hives(&fs) {
-            warn!("Error loading user hives: {:?}", e);
+        reader.load_found_user_hives(fs, &found.users);
+        let all = reader.findings();
+        (Some(reader), all)
+    }
+
+    fn set_machine_hive(&mut self, name: &str, hive: HiveFiles) {
+        match name {
+            "SYSTEM" => self.set_system(hive),
+            "SOFTWARE" => self.set_software(hive),
+            "SECURITY" => self.set_security(hive),
+            _ => self.set_sam(hive),
         }
-        Ok(Box::new(reader))
+    }
+
+    /// Loads user hives found by name, keyed by the SID `ProfileList` gives their profile folder,
+    /// or by their label when none does.
+    fn load_found_user_hives(&mut self, fs: &Arc<dyn FileSystem>, users: &[crate::discovery::UserHive]) {
+        let mut findings = Vec::new();
+        let mut sid_of: BTreeMap<String, String> = BTreeMap::new();
+        match windows::users_with_errors(&*self) {
+            Ok((profiles, errors)) => {
+                for e in &errors {
+                    findings.push(Finding::from_error("reading ProfileList", e));
+                }
+                for p in profiles {
+                    if let Some(folder) = p.profile_path.as_path().file_name() {
+                        sid_of.insert(folder.to_ascii_lowercase(), p.sid);
+                    }
+                }
+            }
+            Err(e) => findings.push(Finding::from_error("reading ProfileList", &e)),
+        }
+        for user in users {
+            let (dir, file) = split(user.path.as_path());
+            let Some(hive) = open_hive_with_logs(fs, dir, file, &mut findings) else {
+                continue;
+            };
+            match sid_of.get(&user.label.to_ascii_lowercase()) {
+                Some(sid) => self.add_user(sid, hive),
+                None => {
+                    findings.push(
+                        Finding::new(
+                            FindingSeverity::Low,
+                            FindingCategory::MissingData,
+                            format!("User hive loaded without a SID: HKU\\{}", user.label),
+                        )
+                        .with_description(format!(
+                            "{} was loaded under HKU\\{}: no ProfileList entry maps that profile \
+                             folder to a SID, so records from it carry the label, not a SID.",
+                            user.path, user.label
+                        ))
+                        .with_metadata(Text::Borrowed("hive.path"), Text::Owned(user.path.to_string())),
+                    );
+                    self.add_user(&user.label, hive);
+                }
+            }
+        }
+        self.record_findings(findings);
     }
 
     pub fn new() -> Self {
@@ -2137,6 +2233,14 @@ impl RecoverDeleted for HiveRegistryReader {
         }
         Ok(all)
     }
+}
+
+/// `path`'s directory and file name, for [open_hive_with_logs].
+fn split(path: &FPath) -> (&FPath, &str) {
+    (
+        path.parent().unwrap_or(FPath::new("")),
+        path.file_name().unwrap_or(path.as_str()),
+    )
 }
 
 /// Opens `name` (plus any discoverable `.LOG1`/`.LOG2` companions) under `base_path` and parses

@@ -912,3 +912,55 @@ fn from_fs_reports_no_findings_for_well_formed_fixture_hives() {
     reader.record_findings(findings);
     assert!(reader.findings().is_empty());
 }
+
+#[test]
+fn load_from_fs_finds_a_triage_collection_by_name() {
+    use forensic_rs::prelude::testing::InMemoryVirtualFileSystem;
+    let bytes = |p: &str| std::fs::read(format!("./artifacts/C/{p}")).unwrap();
+    let sam = bytes("Windows/System32/Config/SAM");
+    let fs: Arc<dyn FileSystem> = Arc::new(
+        InMemoryVirtualFileSystem::new()
+            .with_file("host/CopiedFiles/registry/SAM", sam.clone())
+            .with_file(
+                "host/CopiedFiles/registry/SECURITY",
+                bytes("Windows/System32/Config/SECURITY"),
+            )
+            .with_file(
+                "host/CopiedFiles/registry/SuperSecretAdmin_NTUSER.DAT",
+                bytes("Users/SuperSecretAdmin/NTUSER.DAT"),
+            )
+            // A backup copy deeper down: set aside, with a finding.
+            .with_file("C/Windows/System32/config/RegBack/SAM", sam),
+    );
+    let (reader, findings) = HiveRegistryReader::load_from_fs(&fs);
+    let reader = reader.expect("machine hives found by name");
+    assert!(reader.sam.is_some() && reader.security.is_some());
+    assert!(reader.software.is_none() && reader.system.is_none());
+    // No SOFTWARE, so no ProfileList: the user hive is loaded under its label, and says so.
+    assert!(reader.key(r"HKU\SuperSecretAdmin").is_ok());
+    let titles: Vec<&str> = findings.iter().map(|f| f.title.as_str()).collect();
+    assert!(
+        titles
+            .iter()
+            .any(|t| t.contains(r"without a SID: HKU\SuperSecretAdmin")),
+        "{titles:?}"
+    );
+    assert!(titles.iter().any(|t| t.contains("RegBack/SAM")), "{titles:?}");
+}
+
+#[test]
+fn load_from_fs_returns_none_without_machine_hives() {
+    use forensic_rs::prelude::testing::InMemoryVirtualFileSystem;
+    let fs: Arc<dyn FileSystem> = Arc::new(InMemoryVirtualFileSystem::new().with_text_file("notes.txt", "no hives"));
+    let (reader, findings) = HiveRegistryReader::load_from_fs(&fs);
+    assert!(reader.is_none());
+    assert!(findings.is_empty(), "{findings:?}");
+}
+
+#[test]
+fn load_from_fs_keeps_the_fixed_layout_path() {
+    let fs: Arc<dyn FileSystem> = Arc::new(ChRootFileSystem::new("./artifacts/C/", Arc::new(StdVirtualFS::new())));
+    let (reader, _findings) = HiveRegistryReader::load_from_fs(&fs);
+    let reader = reader.expect("the checked-in Config hives");
+    assert!(reader.sam.is_some() && reader.security.is_some());
+}
