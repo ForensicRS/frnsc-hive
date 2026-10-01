@@ -810,12 +810,15 @@ fn read_value_from_hive(hive: &mut HiveFiles, offset: u64, value_name: &str) -> 
     };
     let key_values_list_offset = kn.key_values_list_offset;
     let number_key_values = kn.number_key_values;
-    let values_cell_list = hive.get_cell_at_offset(key_values_list_offset as u64)?;
     let mut offsets = Vec::with_capacity(number_key_values as usize);
-    if let HiveCell::Invalid(ic) = values_cell_list {
-        for o in parse_offsets_list(&ic.content)? {
-            if o > ROOT_CELL_OFFSET as u32 && o < hive_bins_data_size {
-                offsets.push(o);
+    // A key with no values has no values list: its offset is unset (0xFFFFFFFF), not a cell.
+    if number_key_values > 0 {
+        let values_cell_list = hive.get_cell_at_offset(key_values_list_offset as u64)?;
+        if let HiveCell::Invalid(ic) = values_cell_list {
+            for o in parse_offsets_list(&ic.content)? {
+                if o > ROOT_CELL_OFFSET as u32 && o < hive_bins_data_size {
+                    offsets.push(o);
+                }
             }
         }
     }
@@ -826,7 +829,8 @@ fn read_value_from_hive(hive: &mut HiveFiles, offset: u64, value_name: &str) -> 
             Err(_) => continue,
         };
         if let HiveCell::KeyValue(kv) = value_cell {
-            if kv.value_name == value_name {
+            // Value names compare case-insensitively, as in Windows.
+            if key_names_match(&kv.value_name, value_name) {
                 data = Some((kv.data_offset, kv.data_size, kv.data_type, kv.flags));
                 break;
             }
@@ -864,10 +868,13 @@ fn values_from_hive(hive: &mut HiveFiles, offset: u64) -> ForensicResult<Vec<(St
     };
     let key_values_list_offset = key_node.key_values_list_offset;
     let number_key_values = key_node.number_key_values;
-    let values_cell_list = hive.get_cell_at_offset(key_values_list_offset as u64)?;
     let mut offsets = Vec::with_capacity(number_key_values as usize);
-    if let HiveCell::Invalid(ic) = values_cell_list {
-        offsets.extend(parse_offsets_list(&ic.content)?.into_iter().filter(|&o| o > 0));
+    // A key with no values has no values list: its offset is unset (0xFFFFFFFF), not a cell.
+    if number_key_values > 0 {
+        let values_cell_list = hive.get_cell_at_offset(key_values_list_offset as u64)?;
+        if let HiveCell::Invalid(ic) = values_cell_list {
+            offsets.extend(parse_offsets_list(&ic.content)?.into_iter().filter(|&o| o > 0));
+        }
     }
     let mut results = Vec::with_capacity(offsets.len());
     for offset in offsets {
