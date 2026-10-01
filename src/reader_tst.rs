@@ -131,11 +131,11 @@ fn should_load_hives_from_fs_in_local() {
 }
 
 fn enumerate_keys_test(reader: &dyn Registry) {
-    let builtin = reader.key(r"HKLM\SAM\Domains\Builtin").unwrap();
+    let builtin = reader.key(r"HKLM\SAM\SAM\Domains\Builtin").unwrap();
     let values = builtin.values().unwrap();
     assert_eq!("F", values[0].0);
     assert_eq!("V", values[1].0);
-    let aliases = reader.key(r"HKLM\SAM\Domains\Builtin\Aliases").unwrap();
+    let aliases = reader.key(r"HKLM\SAM\SAM\Domains\Builtin\Aliases").unwrap();
     let names = aliases.keys().unwrap();
     assert_eq!(26, names.len());
 }
@@ -151,15 +151,15 @@ fn enumerate_keys_local_machine(reader: &dyn Registry) {
 
 fn open_keys_sam_hive(reader: &dyn Registry) {
     let key_pairs: [(&str, u64); 9] = [
-        (r"SAM\Domains", 976),
-        (r"SAM\Domains\Builtin", 1112),
-        (r"SAM\Domains\Builtin\Aliases", 2472),
-        (r"SAM\Domains\Builtin\Users", 1944),
-        (r"SAM\Domains\Builtin\Groups", 2208),
-        (r"SAM\Domains\Builtin\Users\Names", 2072),
-        (r"SAM\Domains\Account", 9336),
-        (r"SAM\Domains\Account\Users", 10248),
-        (r"SAM\Domains\Account\Users\Names", 10376),
+        (r"SAM\SAM\Domains", 976),
+        (r"SAM\SAM\Domains\Builtin", 1112),
+        (r"SAM\SAM\Domains\Builtin\Aliases", 2472),
+        (r"SAM\SAM\Domains\Builtin\Users", 1944),
+        (r"SAM\SAM\Domains\Builtin\Groups", 2208),
+        (r"SAM\SAM\Domains\Builtin\Users\Names", 2072),
+        (r"SAM\SAM\Domains\Account", 9336),
+        (r"SAM\SAM\Domains\Account\Users", 10248),
+        (r"SAM\SAM\Domains\Account\Users\Names", 10376),
     ];
     let lm_root = reader.root(PredefinedHive::LocalMachine).unwrap();
     for (key_name, offset) in key_pairs {
@@ -170,7 +170,7 @@ fn open_keys_sam_hive(reader: &dyn Registry) {
         reader.close_raw(&raw);
     }
     let user_names_key = reader
-        .key(r"HKLM\SAM\Domains\Account\Users\Names")
+        .key(r"HKLM\SAM\SAM\Domains\Account\Users\Names")
         .expect("Should list all user names");
     let _admin = user_names_key.open("Administrador").unwrap();
     let users: Vec<String> = user_names_key
@@ -349,7 +349,7 @@ fn should_read_values_of_a_mounted_key_via_values_raw() {
 #[test]
 fn values_into_and_keys_into_match_the_vec_returning_methods() {
     let reader = prepare_sam_reader();
-    let key = reader.key(r"HKLM\SAM\Domains\Builtin\Aliases").unwrap();
+    let key = reader.key(r"HKLM\SAM\SAM\Domains\Builtin\Aliases").unwrap();
 
     let mut via_values = key.values().unwrap();
     let mut via_values_into = Vec::new();
@@ -374,7 +374,7 @@ fn values_into_and_keys_into_match_the_vec_returning_methods() {
 fn values_raw_into_appends_rather_than_replacing_the_callers_buffer() {
     let reader = prepare_sam_reader();
     // `SAM\Domains\Builtin` has "F"/"V" values, per `enumerate_keys_test`.
-    let builtin = reader.key(r"HKLM\SAM\Domains\Builtin").unwrap();
+    let builtin = reader.key(r"HKLM\SAM\SAM\Domains\Builtin").unwrap();
     let expected = builtin.values().unwrap();
 
     let mut out = vec![("preexisting".to_string(), RegValue::DWord(0))];

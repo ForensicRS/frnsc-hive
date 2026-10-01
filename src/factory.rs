@@ -231,7 +231,7 @@ mod tst {
         let registry = mounted.as_registry().expect("factory declares MountKind::Registry");
 
         // Reachable the same way a directly-constructed HiveRegistryReader would expose it.
-        let names_key = registry.key(r"HKLM\SAM\Domains\Account\Users\Names").unwrap();
+        let names_key = registry.key(r"HKLM\SAM\SAM\Domains\Account\Users\Names").unwrap();
         let users: Vec<String> = names_key.keys().unwrap().into_iter().map(|k| k.name).collect();
         assert_eq!("Administrador", users[0]);
     }

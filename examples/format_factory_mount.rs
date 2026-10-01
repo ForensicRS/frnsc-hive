@@ -41,7 +41,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 4. `Mounted::Registry` wraps an `Arc<dyn Registry>` — read through it exactly like any
     //    other `Registry` this crate hands back.
     let registry = mounted.as_registry().expect("we asked for MountKind::Registry");
-    let user_names_key = registry.key(r"HKLM\SAM\Domains\Account\Users\Names")?;
+    let user_names_key = registry.key(r"HKLM\SAM\SAM\Domains\Account\Users\Names")?;
     let users: Vec<String> = user_names_key.keys()?.into_iter().map(|k| k.name).collect();
     println!("Mounted SAM via HiveFormatFactory; local users found: {users:?}");
 

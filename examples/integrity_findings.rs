@@ -53,9 +53,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     //    treated as fatal (recovery/parsing never blocks on it).
     let mut reader = HiveRegistryReader::new();
     reader.set_sam(hive);
-    let root = reader.key(r"HKLM\SAM\Domains")?;
+    let root = reader.key(r"HKLM\SAM\SAM\Domains")?;
     println!(
-        "Hive still readable despite the corruption: {} subkey(s) under HKLM\\SAM\\Domains",
+        "Hive still readable despite the corruption: {} subkey(s) under HKLM\\SAM\\SAM\\Domains",
         root.keys()?.len()
     );
 

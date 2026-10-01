@@ -361,34 +361,33 @@ impl HiveRegistryReader {
         if hkey == "HKEY_LOCAL_MACHINE" {
             let mut splited = path.split(['/', '\\']);
             if let Some(first_key) = splited.next() {
-                // Store using exactly the hive-relative path shape `HiveFiles::open_key_from_offset`
-                // will see as `key_name` for this kind: SAM/SECURITY/SYSTEM pass `path` through
-                // unstripped (their hive's own root has a child literally named e.g. "SAM"), while
-                // SOFTWARE strips its own leading segment — mirrors `open_under_lm`'s stripping
-                // (`src/reader.rs`, `open_under_lm`). A mismatch here would make the value
-                // unreachable once stored, since `HiveFiles.mounted` and the real-tree walk must
-                // agree on path shape.
-                if first_key == "SAM" && self.sam.is_some() {
-                    self.sam.as_ref().inspect(|hive| {
-                        hive.lock().unwrap().add_mounted_value(path, value, data);
-                    });
-                    return;
-                } else if first_key == "SECURITY" && self.security.is_some() {
-                    self.security.as_ref().inspect(|hive| {
-                        hive.lock().unwrap().add_mounted_value(path, value, data);
-                    });
-                    return;
-                } else if first_key == "SYSTEM" && self.system.is_some() {
-                    self.system.as_ref().inspect(|hive| {
-                        hive.lock().unwrap().add_mounted_value(path, value, data);
-                    });
-                    return;
-                } else if first_key == "SOFTWARE" && self.software.is_some() {
-                    let sub_path = path.get(first_key.len() + 1..).unwrap_or("");
-                    self.software.as_ref().inspect(|hive| {
-                        hive.lock().unwrap().add_mounted_value(sub_path, value, data);
-                    });
-                    return;
+                // Store using exactly the hive-relative path `open_under_lm` opens: the hive's
+                // name stripped, and in SYSTEM `CurrentControlSet` resolved. A mismatch here would
+                // make the value unreachable once stored, since `HiveFiles.mounted` and the
+                // real-tree walk must agree on path shape.
+                if let Some(kind) = lm_hive_kind(first_key) {
+                    let rest = path.get(first_key.len() + 1..).unwrap_or("");
+                    let rest = if kind == HiveKind::System {
+                        match self.resolve_control_set(rest) {
+                            Ok(rest) => rest,
+                            Err(e) => {
+                                warn!("REG value {full_path}\\{value} not mounted: {e}");
+                                return;
+                            }
+                        }
+                    } else {
+                        rest.to_string()
+                    };
+                    let hive = match kind {
+                        HiveKind::Sam => self.sam.as_ref(),
+                        HiveKind::Security => self.security.as_ref(),
+                        HiveKind::Software => self.software.as_ref(),
+                        _ => self.system.as_ref(),
+                    };
+                    if let Some(hive) = hive {
+                        hive.lock().unwrap().add_mounted_value(&rest, value, data);
+                        return;
+                    }
                 }
             }
         } else if hkey == "HKEY_USERS" {
@@ -519,22 +518,21 @@ impl HiveRegistryReader {
     }
 
     /// Dispatches a key opened relative to [PredefinedHive::LocalMachine]: `SAM`/`SECURITY`/
-    /// `SOFTWARE`/`SYSTEM` delegate into that hive's own tree (its root cell's single relevant
-    /// child conventionally shares the hive's mount name — e.g. the SAM hive's true root has one
-    /// child literally named `"SAM"` — so the un-stripped path is passed straight through for all
-    /// but `SOFTWARE`, which historically strips its own leading segment); anything else falls
-    /// back to a top-level REG-injected ([MountedMap]) key under `HKEY_LOCAL_MACHINE`.
+    /// `SOFTWARE`/`SYSTEM` (any case, as in Windows) are each a hive mounted there, so the rest of
+    /// the path is opened from that hive's root: `HKLM\SYSTEM\Select` is the SYSTEM hive's
+    /// `Select`, and `HKLM\SAM\SAM\Domains` the SAM hive's `SAM\Domains`. In SYSTEM,
+    /// `CurrentControlSet` is resolved through `Select\Current` ([Self::resolve_control_set]), as
+    /// Windows does when it creates that link. Anything else falls back to a top-level
+    /// REG-injected ([MountedMap]) key under `HKEY_LOCAL_MACHINE`.
     fn open_under_lm(&self, key_name: &str) -> ForensicResult<RawKey> {
-        let (first_key, _rest) = key_name.split_once(['/', '\\']).unwrap_or((key_name, ""));
-        if first_key == "SAM" {
-            return self.open_in_kind(HiveKind::Sam, key_name);
-        } else if first_key == "SECURITY" {
-            return self.open_in_kind(HiveKind::Security, key_name);
-        } else if first_key == "SOFTWARE" {
-            let sub_path = key_name.get(first_key.len() + 1..).unwrap_or("");
-            return self.open_in_kind(HiveKind::Software, sub_path);
-        } else if first_key == "SYSTEM" {
-            return self.open_in_kind(HiveKind::System, key_name);
+        let (first_key, rest) = key_name.split_once(['/', '\\']).unwrap_or((key_name, ""));
+        if let Some(kind) = lm_hive_kind(first_key) {
+            let rest = if kind == HiveKind::System {
+                self.resolve_control_set(rest)?
+            } else {
+                rest.to_string()
+            };
+            return self.open_in_kind(kind, &rest);
         }
         let full_path = format!("HKEY_LOCAL_MACHINE\\{key_name}");
         let is_mounted = self
@@ -558,7 +556,7 @@ impl HiveRegistryReader {
         let position = self
             .users
             .iter()
-            .position(|(name, _)| name == username)
+            .position(|(name, _)| name.eq_ignore_ascii_case(username))
             .ok_or_else(|| ForensicError::registry_key_not_found(PredefinedHive::Users, Some(username.into())))?;
         let (_, hive) = &self.users[position];
         let mut h = try_lock_hive(hive)?;
@@ -572,6 +570,51 @@ impl HiveRegistryReader {
         let offset = h.open_key_from_offset(key_name, ROOT_CELL_OFFSET as i64)?;
         Ok(pack_raw_key(kind, offset.to_payload()))
     }
+
+    /// `path` inside the SYSTEM hive, with a leading `CurrentControlSet` replaced by the control
+    /// set `Select\Current` names (`ControlSet001`). An offline SYSTEM hive has no
+    /// `CurrentControlSet` key: Windows creates it as a link at boot. A hive with no usable
+    /// `Select\Current` is an error that says so, never a guessed `ControlSet001`.
+    fn resolve_control_set(&self, path: &str) -> ForensicResult<String> {
+        let (first, rest) = path.split_once(['/', '\\']).unwrap_or((path, ""));
+        if !first.eq_ignore_ascii_case("CurrentControlSet") {
+            return Ok(path.to_string());
+        }
+        let current = self
+            .value(r"HKLM\SYSTEM\Select", "Current")
+            .map_err(|e| {
+                ForensicError::other(
+                    "registry",
+                    format!("CurrentControlSet can't be resolved: reading SYSTEM\\Select\\Current: {e}"),
+                )
+            })?
+            .as_dword()
+            .ok_or_else(|| ForensicError::registry_invalid_type("REG_DWORD", "SYSTEM\\Select\\Current".to_string()))?;
+        let control_set = format!("ControlSet{current:03}");
+        Ok(if rest.is_empty() {
+            control_set
+        } else {
+            format!("{control_set}\\{rest}")
+        })
+    }
+}
+
+/// The machine hive mounted under `HKLM` as `name`, compared case-insensitively.
+fn lm_hive_kind(name: &str) -> Option<HiveKind> {
+    [
+        ("SAM", HiveKind::Sam),
+        ("SECURITY", HiveKind::Security),
+        ("SOFTWARE", HiveKind::Software),
+        ("SYSTEM", HiveKind::System),
+    ]
+    .into_iter()
+    .find(|(hive, _)| hive.eq_ignore_ascii_case(name))
+    .map(|(_, kind)| kind)
+}
+
+/// Registry key names compare case-insensitively, as in Windows.
+fn key_names_match(a: &str, b: &str) -> bool {
+    a.eq_ignore_ascii_case(b) || (!a.is_ascii() && a.to_uppercase() == b.to_uppercase())
 }
 
 /// Marks a code path that is recognized but intentionally not yet implemented
@@ -1583,7 +1626,7 @@ impl HiveFiles {
                             Some(actual_path.into()),
                         ));
                     }
-                    if kn.key_name != actual_path {
+                    if !key_names_match(&kn.key_name, actual_path) {
                         let (last_offset, counter) = match offset_path.pop() {
                             Some(v) => v,
                             None => {
@@ -1608,7 +1651,10 @@ impl HiveFiles {
                 HiveCell::FastLeaf(fl) => {
                     let mut i = subkey_last_index;
                     for el in fl.elements.iter().skip(i) {
-                        if actual_path.starts_with(&el.name_hint) {
+                        if actual_path
+                            .get(..el.name_hint.len())
+                            .is_some_and(|prefix| key_names_match(prefix, &el.name_hint))
+                        {
                             offset_path.push((next_offset, i));
                             subkey_last_index = 0;
                             next_offset = el.offset;

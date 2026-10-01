@@ -31,20 +31,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 3. Read through the standard `RegistryExt` path API, exactly as you would for a live
     //    registry: `HKLM\SAM\Domains\Account\Users\Names` lists every local user account by SID
     //    subkey name resolved to a display name.
-    let user_names_key = reader.key(r"HKLM\SAM\Domains\Account\Users\Names")?;
+    let user_names_key = reader.key(r"HKLM\SAM\SAM\Domains\Account\Users\Names")?;
     let users: Vec<String> = user_names_key.keys()?.into_iter().map(|k| k.name).collect();
     println!("Local users found in the SAM fixture: {users:?}");
 
     // 4. Values work the same way. `SAM\Domains\Builtin`'s `F`/`V` values hold binary account
     //    data, so this prints their type and size rather than dumping raw bytes.
-    let builtin = reader.key(r"HKLM\SAM\Domains\Builtin")?;
+    let builtin = reader.key(r"HKLM\SAM\SAM\Domains\Builtin")?;
     for (name, value) in builtin.values()? {
         let size = match &value {
             RegValue::Binary(b) => b.len(),
             _ => 0,
         };
         println!(
-            "HKLM\\SAM\\Domains\\Builtin\\{name}: {:?} ({size} bytes)",
+            "HKLM\\SAM\\SAM\\Domains\\Builtin\\{name}: {:?} ({size} bytes)",
             value.value_type()
         );
     }
