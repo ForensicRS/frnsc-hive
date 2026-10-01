@@ -1648,6 +1648,14 @@ impl HiveFiles {
                         continue;
                     }
                     match path_separator.next() {
+                        // A key with no subkeys has no subkeys list (its offset is unset), so a
+                        // child of it doesn't exist: not found, not a cell error.
+                        Some(v) if kn.number_subkeys == 0 => {
+                            return Err(ForensicError::registry_key_not_found(
+                                PredefinedHive::LocalMachine,
+                                Some(v.into()),
+                            ));
+                        }
                         Some(v) => {
                             actual_path = v;
                             next_offset = kn.subkeys_list_offset;
