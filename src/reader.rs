@@ -270,11 +270,14 @@ impl HiveRegistryReader {
             if profile.profile_path.as_str().is_empty() {
                 continue;
             }
-            let hive = match open_hive_with_logs(fs, profile.profile_path.as_path(), "NTUSER.DAT", &mut findings) {
+            // A mandatory profile's `NTUSER.MAN` is the hive Windows loads when it exists.
+            let hive = match open_hive_with_logs(fs, profile.profile_path.as_path(), "NTUSER.MAN", &mut findings)
+                .or_else(|| open_hive_with_logs(fs, profile.profile_path.as_path(), "NTUSER.DAT", &mut findings))
+            {
                 Some(v) => v,
                 None => {
                     warn!(
-                        "Cannot find hive {}\\NTUSER.DAT for user {}",
+                        "Cannot find hive {}\\NTUSER.DAT (or NTUSER.MAN) for user {}",
                         profile.profile_path, profile.sid
                     );
                     continue;

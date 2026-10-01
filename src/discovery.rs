@@ -15,6 +15,11 @@ use crate::hive::is_valid_base_block;
 
 /// Machine hives, by the file name they're exported under.
 pub const MACHINE_HIVES: [&str; 4] = ["SAM", "SECURITY", "SOFTWARE", "SYSTEM"];
+/// A user hive's file name, lowercase: `NTUSER.DAT`, or `NTUSER.MAN` for a mandatory profile.
+/// Matched as a suffix, so an export's `<user>_NTUSER.DAT` is one too. Same length, on purpose:
+/// [user_label] strips either.
+const USER_HIVE_NAMES: [&str; 2] = ["ntuser.dat", "ntuser.man"];
+
 /// Default walk depth: deep enough for `<collection>/<host>/CopiedFiles/registry/<hive>`.
 pub const MAX_DEPTH: u32 = 8;
 
@@ -75,7 +80,7 @@ pub fn find_hives(fs: &dyn FileSystem) -> HiveCandidates {
                 Ok(None) => {} // not a hive at all: a file that happens to be called SYSTEM
                 Err(e) => out.errors.push(e),
             }
-        } else if lower.ends_with("ntuser.dat") {
+        } else if USER_HIVE_NAMES.iter().any(|n| lower.ends_with(n)) {
             match header_hint(fs, entry.path.as_path()) {
                 Ok(Some(_)) => out.users.push(UserHive {
                     label: user_label(entry.path.as_path(), &name),
@@ -104,6 +109,27 @@ pub fn find_hives(fs: &dyn FileSystem) -> HiveCandidates {
         }
     }
     out.users.sort_by(|a, b| a.path.cmp(&b.path));
+    // Windows loads `NTUSER.MAN` instead of `NTUSER.DAT` when a profile has both, and both would
+    // load under the same label: keep the one Windows uses, report the other.
+    let mandatory: Vec<(Option<String>, String)> = out
+        .users
+        .iter()
+        .filter(|u| u.path.as_str().to_ascii_lowercase().ends_with("ntuser.man"))
+        .map(|u| (u.path.parent().map(|p| p.as_str().to_string()), u.label.clone()))
+        .collect();
+    let (kept, shadowed): (Vec<UserHive>, Vec<UserHive>) = std::mem::take(&mut out.users).into_iter().partition(|u| {
+        !u.path.as_str().to_ascii_lowercase().ends_with("ntuser.dat")
+            || !mandatory
+                .iter()
+                .any(|(dir, label)| *dir == u.path.parent().map(|p| p.as_str().to_string()) && *label == u.label)
+    });
+    for user in shadowed {
+        out.findings.push(set_aside(
+            &user.path,
+            "NTUSER.MAN in the same folder is the profile's hive (a mandatory profile)".to_string(),
+        ));
+    }
+    out.users = kept;
     out.amcache.sort();
     out
 }
@@ -152,7 +178,7 @@ fn rank(path: &FPath) -> (u8, usize, String) {
 }
 
 fn user_label(path: &FPath, name: &str) -> String {
-    let prefix = &name[..name.len() - "ntuser.dat".len()];
+    let prefix = &name[..name.len() - USER_HIVE_NAMES[0].len()];
     let prefix = prefix.trim_end_matches(['_', '-', '.', ' ']);
     if prefix.is_empty() {
         path.parent()
@@ -226,5 +252,36 @@ mod tests {
         assert_eq!(found.amcache.len(), 1);
         // Two SYSTEM copies set aside, one SAM rejected by its header.
         assert_eq!(found.findings.len(), 3, "{:?}", found.findings);
+    }
+
+    #[test]
+    fn a_mandatory_profile_s_ntuser_man_is_a_user_hive_and_wins_over_ntuser_dat() {
+        let fs = InMemoryVirtualFileSystem::new()
+            .with_file("C/Windows/System32/config/SYSTEM", base_block(""))
+            .with_file("C/Users/kiosk/NTUSER.MAN", base_block(""))
+            .with_file("C/Users/kiosk/NTUSER.DAT", base_block(""))
+            .with_file("C/Users/carol/NTUSER.MAN", base_block(""))
+            .with_file("C/Users/dave/NTUSER.DAT", base_block(""));
+        let found = find_hives(&fs);
+        let users: Vec<(&str, &str)> = found
+            .users
+            .iter()
+            .map(|u| (u.label.as_str(), u.path.as_str()))
+            .collect();
+        assert_eq!(
+            users,
+            [
+                ("carol", "C/Users/carol/NTUSER.MAN"),
+                ("dave", "C/Users/dave/NTUSER.DAT"),
+                ("kiosk", "C/Users/kiosk/NTUSER.MAN"),
+            ]
+        );
+        // The shadowed NTUSER.DAT is reported, not silently dropped.
+        assert_eq!(found.findings.len(), 1, "{:?}", found.findings);
+        assert!(
+            found.findings[0].title.contains("C/Users/kiosk/NTUSER.DAT"),
+            "{:?}",
+            found.findings
+        );
     }
 }
