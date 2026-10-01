@@ -10,8 +10,8 @@
 //! own) and a positive cell-size prefix (meaning "unallocated") becomes [HiveCell::Unallocated].
 //!
 //! [BigDataCell]/the `db` signature is defined per the format spec but never produced by
-//! [read_cell] — chunked "big data" values (values too large to store in one cell) are not
-//! currently decoded.
+//! [read_cell]: a big-data record reaches the reader as an [HiveCell::Invalid] data cell, and
+//! `reader::value_data` reassembles its segments.
 
 use forensic_rs::prelude::{ByteReader, ForensicError, ForensicResult, FromBytes};
 pub const INDEX_LEAF_SIGNATURE: &[u8; 2] = b"li";

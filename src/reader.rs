@@ -33,7 +33,7 @@ use std::{
 use forensic_rs::prelude::*;
 
 use crate::{
-    cell::{HashLeafCell, HiveCell, KeyNodeCell, peek_cell, read_cell},
+    cell::{HashLeafCell, HiveCell, InvalidCell, KeyNodeCell, peek_cell, read_cell},
     cell_cache::CellCache,
     consts::{HIVE_BASE_BLOCK_SIZE, ROOT_CELL_OFFSET},
     hive::{BaseBlock, read_base_block, read_cells, read_hive_bin_at_file_position},
@@ -748,7 +748,12 @@ pub(crate) fn decode_value_cell(
     if cached_size < 0 {
         return Ok(decode_resident_value(data_type, data_offset, cached_size));
     }
-    let data_cell = hive.get_cell_at_offset(data_offset as u64)?;
+    // Exactly the value's bytes: a cell is padded to 8 bytes, and a value larger than one cell
+    // holds is a big-data (`db`) record of segments. Both used to reach callers raw.
+    let data_cell = &HiveCell::Invalid(InvalidCell {
+        offset: data_offset as u64,
+        content: value_data(hive, data_type, data_offset, data_size)?,
+    });
     match data_type {
         DATA_TYPE_REG_SZ | DATA_TYPE_REG_EXPAND_SZ => match data_cell {
             HiveCell::Invalid(ic) => {
@@ -795,6 +800,73 @@ pub(crate) fn decode_value_cell(
             other => Err(unexpected_value_cell(data_type, data_offset, other)),
         },
     }
+}
+
+/// The most data one big-data segment holds, and so the size past which a value is stored as a
+/// big-data (`db`) record instead of in one cell (hive format 1.4 and later).
+const BIG_DATA_SEGMENT_SIZE: usize = 16_344;
+
+/// The `data_size` bytes of a non-resident value at `data_offset`: the start of its data cell,
+/// or, for a big-data record, its segments joined. A cell or record holding less than the value
+/// declares is an error, never a short value.
+fn value_data(hive: &mut HiveFiles, data_type: u32, data_offset: u32, data_size: u32) -> ForensicResult<Vec<u8>> {
+    let size = data_size as usize;
+    let content = match hive.get_cell_at_offset(data_offset as u64)? {
+        HiveCell::Invalid(ic) => ic.content.clone(),
+        HiveCell::Unallocated(_) => return Err(unallocated_value_error(data_type, data_offset)),
+        other => return Err(unexpected_value_cell(data_type, data_offset, other)),
+    };
+    let big_data = size > BIG_DATA_SEGMENT_SIZE && hive.base_block.minor_version >= 4 && content.starts_with(b"db");
+    if !big_data {
+        return content.get(..size).map(<[u8]>::to_vec).ok_or_else(|| {
+            ForensicError::registry_cell_error(
+                "key_value_data",
+                format!(
+                    "data cell at offset={data_offset} holds {} bytes, the value declares {size}",
+                    content.len()
+                ),
+            )
+        });
+    }
+    let header = |range: std::ops::Range<usize>| {
+        content.get(range).ok_or_else(|| {
+            ForensicError::registry_cell_error("big_data", format!("record at offset={data_offset} is truncated"))
+        })
+    };
+    let segments = u16::from_le_bytes(header(2..4)?.try_into().unwrap_or_default()) as usize;
+    let list_offset = u32::from_le_bytes(header(4..8)?.try_into().unwrap_or_default());
+    let list = match hive.get_cell_at_offset(list_offset as u64)? {
+        HiveCell::Invalid(ic) => ic.content.clone(),
+        other => return Err(unexpected_value_cell(data_type, list_offset, other)),
+    };
+    let list = list.get(..segments * 4).ok_or_else(|| {
+        ForensicError::registry_cell_error(
+            "big_data",
+            format!("segment list at offset={list_offset} holds fewer than {segments} entries"),
+        )
+    })?;
+    let mut out = Vec::with_capacity(size);
+    for segment_offset in parse_offsets_list(list)? {
+        if out.len() >= size {
+            break;
+        }
+        let segment = match hive.get_cell_at_offset(segment_offset as u64)? {
+            HiveCell::Invalid(ic) => ic.content.clone(),
+            other => return Err(unexpected_value_cell(data_type, segment_offset, other)),
+        };
+        let take = BIG_DATA_SEGMENT_SIZE.min(size - out.len()).min(segment.len());
+        out.extend_from_slice(&segment[..take]);
+    }
+    if out.len() < size {
+        return Err(ForensicError::registry_cell_error(
+            "big_data",
+            format!(
+                "record at offset={data_offset}: {segments} segment(s) hold {} bytes, the value declares {size}",
+                out.len()
+            ),
+        ));
+    }
+    Ok(out)
 }
 
 fn read_value_from_hive(hive: &mut HiveFiles, offset: u64, value_name: &str) -> ForensicResult<RegValue> {
