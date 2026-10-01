@@ -48,7 +48,48 @@ const DATA_TYPE_REG_EXPAND_SZ: u32 = 0x2;
 const DATA_TYPE_REG_BINARY: u32 = 0x03;
 const DATA_TYPE_REG_DWORD: u32 = 0x04;
 const DATA_TYPE_REG_DWORD_BE: u32 = 0x05;
+const DATA_TYPE_REG_LINK: u32 = 0x6;
+const DATA_TYPE_REG_MULTI_SZ: u32 = 0x7;
+const DATA_TYPE_REG_RESOURCE_LIST: u32 = 0x8;
+const DATA_TYPE_REG_FULL_RESOURCE_DESCRIPTOR: u32 = 0x9;
+const DATA_TYPE_REG_RESOURCE_REQUIREMENTS_LIST: u32 = 0xa;
 const DATA_TYPE_REG_QWORD: u32 = 0xb;
+
+/// The UTF-16LE code units of `data` (a trailing odd byte is dropped).
+fn utf16_units(data: &[u8]) -> Vec<u16> {
+    data.chunks_exact(2).map(|p| u16::from_le_bytes([p[0], p[1]])).collect()
+}
+
+/// A `REG_MULTI_SZ`: its NUL-separated strings, without the empty one(s) that end the list. An
+/// empty string *inside* the list is kept: it was stored.
+fn decode_multi_sz(data: &[u8]) -> Vec<String> {
+    let units = utf16_units(data);
+    let mut strings: Vec<String> = units.split(|&u| u == 0).map(String::from_utf16_lossy).collect();
+    while strings.last().is_some_and(String::is_empty) {
+        strings.pop();
+    }
+    strings
+}
+
+/// A NUL-terminated UTF-16LE string (`REG_LINK`).
+fn decode_utf16_string(data: &[u8]) -> String {
+    let units = utf16_units(data);
+    let end = units.iter().position(|&u| u == 0).unwrap_or(units.len());
+    String::from_utf16_lossy(&units[..end])
+}
+
+/// The types whose data is plain bytes or UTF-16 text, decoded the same whether the data is
+/// resident or in a cell. `None` for the types decoded elsewhere.
+fn decode_bytes_value(data_type: u32, data: &[u8]) -> Option<RegValue> {
+    Some(match data_type {
+        DATA_TYPE_REG_LINK => RegValue::Link(decode_utf16_string(data)),
+        DATA_TYPE_REG_MULTI_SZ => RegValue::MultiSZ(decode_multi_sz(data)),
+        DATA_TYPE_REG_RESOURCE_LIST => RegValue::ResourceList(data.to_vec()),
+        DATA_TYPE_REG_FULL_RESOURCE_DESCRIPTOR => RegValue::FullResourceDescriptor(data.to_vec()),
+        DATA_TYPE_REG_RESOURCE_REQUIREMENTS_LIST => RegValue::ResourceRequirementsList(data.to_vec()),
+        _ => return None,
+    })
+}
 
 /// Implements [Registry] from Hive files.
 ///
@@ -699,6 +740,9 @@ fn decode_resident_value(data_type: u32, data_offset: u32, cached_size: i32) -> 
     let value = data_offset;
     let raw = value.to_le_bytes();
     let data = &raw[0..size.min(raw.len())];
+    if let Some(value) = decode_bytes_value(data_type, data) {
+        return value;
+    }
     match data_type {
         DATA_TYPE_REG_BINARY => RegValue::Binary(data.to_vec()),
         DATA_TYPE_REG_SZ | DATA_TYPE_REG_EXPAND_SZ => {
@@ -788,6 +832,18 @@ pub(crate) fn decode_value_cell(
         },
         DATA_TYPE_REG_QWORD => match data_cell {
             HiveCell::Invalid(ic) => Ok(RegValue::QWord(ic.into_qword_le()?)),
+            HiveCell::Unallocated(_) => Err(unallocated_value_error(data_type, data_offset)),
+            other => Err(unexpected_value_cell(data_type, data_offset, other)),
+        },
+        DATA_TYPE_REG_LINK
+        | DATA_TYPE_REG_MULTI_SZ
+        | DATA_TYPE_REG_RESOURCE_LIST
+        | DATA_TYPE_REG_FULL_RESOURCE_DESCRIPTOR
+        | DATA_TYPE_REG_RESOURCE_REQUIREMENTS_LIST => match data_cell {
+            HiveCell::Invalid(ic) => Ok(decode_bytes_value(data_type, &ic.content).unwrap_or(RegValue::Unknown {
+                ty: data_type,
+                data: ic.content.clone(),
+            })),
             HiveCell::Unallocated(_) => Err(unallocated_value_error(data_type, data_offset)),
             other => Err(unexpected_value_cell(data_type, data_offset, other)),
         },
