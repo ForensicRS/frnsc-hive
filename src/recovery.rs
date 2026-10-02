@@ -208,7 +208,10 @@ pub(crate) fn scan_deleted_keys(hive: &mut HiveFiles) -> ForensicResult<Vec<Reco
                 parent_hint,
             },
             Recovery::DeletedMetadata,
-            Locus::Hive { cell: offset as u32, value_index: 0 },
+            Locus::Hive {
+                cell: offset as u32,
+                value_index: 0,
+            },
         ));
     }
     Ok(recovered)
@@ -244,7 +247,10 @@ pub(crate) fn scan_deleted_values(hive: &mut HiveFiles) -> ForensicResult<Vec<Re
                 value,
             },
             Recovery::DeletedMetadata,
-            Locus::Hive { cell: offset as u32, value_index: 0 },
+            Locus::Hive {
+                cell: offset as u32,
+                value_index: 0,
+            },
         ));
     }
     Ok(recovered)
