@@ -73,3 +73,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `cell::InvalidCell::into_dword`/`into_dword_le`/`into_dword_be`/`into_qword_le` now return
   `ForensicResult<_>` instead of silently decoding a truncated/oversized value as `0`.
 
+## [0.13.4] - 2025-02-18
+
+### Added
+
+- Support for MacOS in Github CI
+
+### Fixed
+
+- Mounted and user hives HKEY offset
