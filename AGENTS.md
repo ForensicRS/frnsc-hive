@@ -27,6 +27,9 @@ stands in for) real hive-backed keys.
   impl), `HiveFiles` (one loaded hive + its cached cells/logs), the `RawKey` bit-packing scheme,
   mounted/real key merging logic, and the `Finding`-accumulation wiring (`findings`/
   `record_findings`).
+- [`src/value.rs`](src/value.rs) — value type codes and decoding a value's bytes into a
+  `RegValue` (resident data, cell data, offsets lists); shared by the file reader and other cell
+  sources such as frnsc-memory's in-memory hives.
 - [`src/factory.rs`](src/factory.rs) — `HiveFormatFactory`, the `forensic_rs::traits::format::
   FormatFactory` impl that sniffs/mounts a single hive file (plus discoverable `.LOG1`/`.LOG2`
   companions) as `Mounted::Registry`, for use with `forensic_rs::core::resolver::MountResolver`.

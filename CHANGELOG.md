@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `value` module: the registry value type codes and the decoding of a value's bytes
+  (`value::decode`, `decode_resident_value`, `parse_offsets_list`, `BIG_DATA_SEGMENT_SIZE`),
+  moved out of `reader` and made public so other sources of hive cells (a hive read from
+  memory) decode values exactly as the file reader does. The file reader's behaviour is
+  unchanged.
 - `HiveRegistryReader::load_from_fs`, returning the reader together with its integrity findings
   (`from_fs` returns a `Box<dyn Registry>`, which hides them). When `C:\Windows\System32\Config`
   holds no machine hive, it searches the whole filesystem by name

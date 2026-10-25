@@ -968,12 +968,15 @@ fn load_from_fs_keeps_the_fixed_layout_path() {
 #[test]
 fn multi_sz_drops_the_terminators_and_keeps_inner_empty_strings() {
     let encode = |s: &str| s.encode_utf16().flat_map(u16::to_le_bytes).collect::<Vec<u8>>();
-    assert_eq!(super::decode_multi_sz(&encode("SamSS\0Srv\0\0")), ["SamSS", "Srv"]);
-    assert_eq!(super::decode_multi_sz(&encode("a\0\0b\0\0")), ["a", "", "b"]);
-    assert!(super::decode_multi_sz(&encode("\0\0")).is_empty());
-    assert!(super::decode_multi_sz(&[]).is_empty());
     assert_eq!(
-        super::decode_utf16_string(&encode("\\Registry\\Machine\0junk")),
+        crate::value::decode_multi_sz(&encode("SamSS\0Srv\0\0")),
+        ["SamSS", "Srv"]
+    );
+    assert_eq!(crate::value::decode_multi_sz(&encode("a\0\0b\0\0")), ["a", "", "b"]);
+    assert!(crate::value::decode_multi_sz(&encode("\0\0")).is_empty());
+    assert!(crate::value::decode_multi_sz(&[]).is_empty());
+    assert_eq!(
+        crate::value::decode_utf16_string(&encode("\\Registry\\Machine\0junk")),
         "\\Registry\\Machine"
     );
 }

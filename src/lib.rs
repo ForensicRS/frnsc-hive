@@ -8,6 +8,7 @@ pub mod log;
 pub(crate) mod mounted_map;
 pub mod reader;
 pub(crate) mod recovery;
+pub mod value;
 
 #[cfg(test)]
 pub(crate) mod tst;

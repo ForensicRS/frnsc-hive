@@ -33,63 +33,15 @@ use std::{
 use forensic_rs::prelude::*;
 
 use crate::{
-    cell::{HashLeafCell, HiveCell, InvalidCell, KeyNodeCell, peek_cell, read_cell},
+    cell::{HashLeafCell, HiveCell, KeyNodeCell, peek_cell, read_cell},
     cell_cache::CellCache,
     consts::{HIVE_BASE_BLOCK_SIZE, ROOT_CELL_OFFSET},
     hive::{BaseBlock, read_base_block, read_cells, read_hive_bin_at_file_position},
     log::{apply_entries, read_log_entries, select_entries_to_apply},
     mounted_map::{MountedCell, MountedMap},
     recovery,
+    value::{self, BIG_DATA_SEGMENT_SIZE, DATA_TYPE_NONE, decode_resident_value, parse_offsets_list},
 };
-
-const DATA_TYPE_NONE: u32 = 0x0;
-const DATA_TYPE_REG_SZ: u32 = 0x1;
-const DATA_TYPE_REG_EXPAND_SZ: u32 = 0x2;
-const DATA_TYPE_REG_BINARY: u32 = 0x03;
-const DATA_TYPE_REG_DWORD: u32 = 0x04;
-const DATA_TYPE_REG_DWORD_BE: u32 = 0x05;
-const DATA_TYPE_REG_LINK: u32 = 0x6;
-const DATA_TYPE_REG_MULTI_SZ: u32 = 0x7;
-const DATA_TYPE_REG_RESOURCE_LIST: u32 = 0x8;
-const DATA_TYPE_REG_FULL_RESOURCE_DESCRIPTOR: u32 = 0x9;
-const DATA_TYPE_REG_RESOURCE_REQUIREMENTS_LIST: u32 = 0xa;
-const DATA_TYPE_REG_QWORD: u32 = 0xb;
-
-/// The UTF-16LE code units of `data` (a trailing odd byte is dropped).
-fn utf16_units(data: &[u8]) -> Vec<u16> {
-    data.chunks_exact(2).map(|p| u16::from_le_bytes([p[0], p[1]])).collect()
-}
-
-/// A `REG_MULTI_SZ`: its NUL-separated strings, without the empty one(s) that end the list. An
-/// empty string *inside* the list is kept: it was stored.
-fn decode_multi_sz(data: &[u8]) -> Vec<String> {
-    let units = utf16_units(data);
-    let mut strings: Vec<String> = units.split(|&u| u == 0).map(String::from_utf16_lossy).collect();
-    while strings.last().is_some_and(String::is_empty) {
-        strings.pop();
-    }
-    strings
-}
-
-/// A NUL-terminated UTF-16LE string (`REG_LINK`).
-fn decode_utf16_string(data: &[u8]) -> String {
-    let units = utf16_units(data);
-    let end = units.iter().position(|&u| u == 0).unwrap_or(units.len());
-    String::from_utf16_lossy(&units[..end])
-}
-
-/// The types whose data is plain bytes or UTF-16 text, decoded the same whether the data is
-/// resident or in a cell. `None` for the types decoded elsewhere.
-fn decode_bytes_value(data_type: u32, data: &[u8]) -> Option<RegValue> {
-    Some(match data_type {
-        DATA_TYPE_REG_LINK => RegValue::Link(decode_utf16_string(data)),
-        DATA_TYPE_REG_MULTI_SZ => RegValue::MultiSZ(decode_multi_sz(data)),
-        DATA_TYPE_REG_RESOURCE_LIST => RegValue::ResourceList(data.to_vec()),
-        DATA_TYPE_REG_FULL_RESOURCE_DESCRIPTOR => RegValue::FullResourceDescriptor(data.to_vec()),
-        DATA_TYPE_REG_RESOURCE_REQUIREMENTS_LIST => RegValue::ResourceRequirementsList(data.to_vec()),
-        _ => return None,
-    })
-}
 
 /// Implements [Registry] from Hive files.
 ///
@@ -694,26 +646,6 @@ fn try_lock_hive(hive: &Mutex<HiveFiles>) -> ForensicResult<MutexGuard<'_, HiveF
         .map_err(|e| ForensicError::other("registry", format!("Error locking hive: {e:?}")))
 }
 
-/// Parses the raw bytes of a `KeyValue`s-list `Invalid` cell into the 4-byte-aligned `u32`
-/// offsets it contains. A byte length that isn't a multiple of 4 means the cell's declared size
-/// doesn't align to 4-byte offset entries — a corruption signal in its own right — so this
-/// returns an `Err` rather than silently truncating the trailing partial entry.
-fn parse_offsets_list(content: &[u8]) -> ForensicResult<Vec<u32>> {
-    if content.len() % 4 != 0 {
-        return Err(ForensicError::registry_cell_error(
-            "key_values_offsets_list",
-            format!(
-                "offsets-list cell length {} is not a multiple of 4 (declared size doesn't align to 4-byte entries)",
-                content.len()
-            ),
-        ));
-    }
-    Ok(content
-        .chunks_exact(4)
-        .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
-        .collect())
-}
-
 fn unallocated_value_error(data_type: u32, data_offset: u32) -> ForensicError {
     ForensicError::registry_cell_error(
         "key_value_data",
@@ -732,49 +664,6 @@ fn unexpected_value_cell(data_type: u32, data_offset: u32, cell: &HiveCell) -> F
     )
 }
 
-/// Decodes a value whose data is small enough to be stored "resident" — directly inside the
-/// `data_offset` field of its `KeyValueCell`, rather than in a separate cell — as signaled by a
-/// negative `data_size`.
-fn decode_resident_value(data_type: u32, data_offset: u32, cached_size: i32) -> RegValue {
-    let size = (i32::MIN - cached_size).unsigned_abs() as usize;
-    let value = data_offset;
-    let raw = value.to_le_bytes();
-    let data = &raw[0..size.min(raw.len())];
-    if let Some(value) = decode_bytes_value(data_type, data) {
-        return value;
-    }
-    match data_type {
-        DATA_TYPE_REG_BINARY => RegValue::Binary(data.to_vec()),
-        DATA_TYPE_REG_SZ | DATA_TYPE_REG_EXPAND_SZ => {
-            // `data.len().checked_sub(2)` (rather than the unchecked `data.len() - 2`) avoids a
-            // subtract-with-overflow panic when a resident string value's declared size is 0 or 1.
-            let s = match (data.len().checked_sub(2).and_then(|i| data.get(i)), data.last()) {
-                (Some(0), Some(0)) => {
-                    if data.len() == 2 {
-                        String::new()
-                    } else {
-                        String::from_utf16_lossy(&[u16::from_le_bytes([data[0], data[1]])])
-                    }
-                }
-                (Some(_), Some(0)) => String::from_utf8_lossy(&data[..data.len() - 1]).to_string(),
-                _ => String::from_utf8_lossy(data).to_string(),
-            };
-            if data_type == DATA_TYPE_REG_EXPAND_SZ {
-                RegValue::ExpandSZ(s)
-            } else {
-                RegValue::SZ(s)
-            }
-        }
-        DATA_TYPE_REG_DWORD => RegValue::DWord(value),
-        DATA_TYPE_REG_DWORD_BE => RegValue::DWord(value.to_be()),
-        DATA_TYPE_REG_QWORD => RegValue::QWord(value as u64),
-        _ => RegValue::Unknown {
-            ty: data_type,
-            data: data.to_vec(),
-        },
-    }
-}
-
 /// Decodes a `KeyValueCell`'s data given its already-extracted `data_type`/`data_offset`/
 /// `data_size`/`flags` fields. Shared by the eager ([read_value_from_hive]/[values_from_hive])
 /// and lazy ([HiveValuesIter]) enumeration paths.
@@ -788,79 +677,14 @@ pub(crate) fn decode_value_cell(
     if data_type == DATA_TYPE_NONE {
         return Ok(RegValue::None);
     }
-    let cached_size = data_size as i32;
-    if cached_size < 0 {
-        return Ok(decode_resident_value(data_type, data_offset, cached_size));
+    if (data_size as i32) < 0 {
+        return Ok(decode_resident_value(data_type, data_offset, data_size as i32));
     }
     // Exactly the value's bytes: a cell is padded to 8 bytes, and a value larger than one cell
     // holds is a big-data (`db`) record of segments. Both used to reach callers raw.
-    let data_cell = &HiveCell::Invalid(InvalidCell {
-        offset: data_offset as u64,
-        content: value_data(hive, data_type, data_offset, data_size)?,
-    });
-    match data_type {
-        DATA_TYPE_REG_SZ | DATA_TYPE_REG_EXPAND_SZ => match data_cell {
-            HiveCell::Invalid(ic) => {
-                let s = if flags & 1 == 0 {
-                    ic.into_reg_sz_ascii()
-                } else {
-                    ic.into_reg_sz_extended()
-                };
-                Ok(if data_type == DATA_TYPE_REG_EXPAND_SZ {
-                    RegValue::ExpandSZ(s)
-                } else {
-                    RegValue::SZ(s)
-                })
-            }
-            HiveCell::Unallocated(_) => Err(unallocated_value_error(data_type, data_offset)),
-            other => Err(unexpected_value_cell(data_type, data_offset, other)),
-        },
-        DATA_TYPE_REG_BINARY => match data_cell {
-            HiveCell::Invalid(ic) => Ok(RegValue::Binary(ic.content.clone())),
-            HiveCell::Unallocated(_) => Err(unallocated_value_error(data_type, data_offset)),
-            other => Err(unexpected_value_cell(data_type, data_offset, other)),
-        },
-        DATA_TYPE_REG_DWORD => match data_cell {
-            HiveCell::Invalid(ic) => Ok(RegValue::DWord(ic.into_dword_le()?)),
-            HiveCell::Unallocated(_) => Err(unallocated_value_error(data_type, data_offset)),
-            other => Err(unexpected_value_cell(data_type, data_offset, other)),
-        },
-        DATA_TYPE_REG_DWORD_BE => match data_cell {
-            HiveCell::Invalid(ic) => Ok(RegValue::DWord(ic.into_dword_be()?)),
-            HiveCell::Unallocated(_) => Err(unallocated_value_error(data_type, data_offset)),
-            other => Err(unexpected_value_cell(data_type, data_offset, other)),
-        },
-        DATA_TYPE_REG_QWORD => match data_cell {
-            HiveCell::Invalid(ic) => Ok(RegValue::QWord(ic.into_qword_le()?)),
-            HiveCell::Unallocated(_) => Err(unallocated_value_error(data_type, data_offset)),
-            other => Err(unexpected_value_cell(data_type, data_offset, other)),
-        },
-        DATA_TYPE_REG_LINK
-        | DATA_TYPE_REG_MULTI_SZ
-        | DATA_TYPE_REG_RESOURCE_LIST
-        | DATA_TYPE_REG_FULL_RESOURCE_DESCRIPTOR
-        | DATA_TYPE_REG_RESOURCE_REQUIREMENTS_LIST => match data_cell {
-            HiveCell::Invalid(ic) => Ok(decode_bytes_value(data_type, &ic.content).unwrap_or(RegValue::Unknown {
-                ty: data_type,
-                data: ic.content.clone(),
-            })),
-            HiveCell::Unallocated(_) => Err(unallocated_value_error(data_type, data_offset)),
-            other => Err(unexpected_value_cell(data_type, data_offset, other)),
-        },
-        _ => match data_cell {
-            HiveCell::Invalid(ic) => Ok(RegValue::Unknown {
-                ty: data_type,
-                data: ic.content.clone(),
-            }),
-            HiveCell::Unallocated(_) => Err(unallocated_value_error(data_type, data_offset)),
-            other => Err(unexpected_value_cell(data_type, data_offset, other)),
-        },
-    }
+    let data = value_data(hive, data_type, data_offset, data_size)?;
+    value::decode(data_type, flags, &data)
 }
-
-/// The most data one big-data segment holds, and so the size past which a value is stored as a
-/// big-data (`db`) record instead of in one cell (hive format 1.4 and later).
-const BIG_DATA_SEGMENT_SIZE: usize = 16_344;
 
 /// The `data_size` bytes of a non-resident value at `data_offset`: the start of its data cell,
 /// or, for a big-data record, its segments joined. A cell or record holding less than the value
