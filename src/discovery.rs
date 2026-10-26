@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 use std::io::Read;
 
 use forensic_rs::core::fs::walk::WalkOptions;
+use forensic_rs::core::path::Component;
 use forensic_rs::prelude::*;
 
 use crate::hive::is_valid_base_block;
@@ -19,6 +20,10 @@ pub const MACHINE_HIVES: [&str; 4] = ["SAM", "SECURITY", "SOFTWARE", "SYSTEM"];
 /// Matched as a suffix, so an export's `<user>_NTUSER.DAT` is one too. Same length, on purpose:
 /// [user_label] strips either.
 const USER_HIVE_NAMES: [&str; 2] = ["ntuser.dat", "ntuser.man"];
+/// A user's class hive's file name, lowercase, matched as a suffix like [USER_HIVE_NAMES]. In a
+/// profile it lives at `AppData\Local\Microsoft\Windows\UsrClass.dat` and is loaded by Windows as
+/// `HKU\<sid>_Classes`.
+const CLASS_HIVE_NAME: &str = "usrclass.dat";
 
 /// Default walk depth: deep enough for `<collection>/<host>/CopiedFiles/registry/<hive>`.
 pub const MAX_DEPTH: u32 = 8;
@@ -37,6 +42,9 @@ pub struct HiveCandidates {
     /// One path per machine hive name (`SAM`, `SECURITY`, `SOFTWARE`, `SYSTEM`).
     pub machine: BTreeMap<&'static str, FPathBuf>,
     pub users: Vec<UserHive>,
+    /// Users' `UsrClass.dat`, labelled by the profile folder they're under (or the prefix of
+    /// `<user>_UsrClass.dat`), so a label matches the same user's [Self::users] entry.
+    pub classes: Vec<UserHive>,
     pub amcache: Vec<FPathBuf>,
     /// Candidates set aside: duplicates, and files whose header names another hive.
     pub findings: Vec<Finding>,
@@ -89,6 +97,15 @@ pub fn find_hives(fs: &dyn FileSystem) -> HiveCandidates {
                 Ok(None) => {}
                 Err(e) => out.errors.push(e),
             }
+        } else if lower.ends_with(CLASS_HIVE_NAME) {
+            match header_hint(fs, entry.path.as_path()) {
+                Ok(Some(_)) => out.classes.push(UserHive {
+                    label: class_label(entry.path.as_path(), &name),
+                    path: entry.path,
+                }),
+                Ok(None) => {}
+                Err(e) => out.errors.push(e),
+            }
         } else if lower == "amcache.hve" {
             match header_hint(fs, entry.path.as_path()) {
                 Ok(Some(_)) => out.amcache.push(entry.path),
@@ -130,6 +147,7 @@ pub fn find_hives(fs: &dyn FileSystem) -> HiveCandidates {
         ));
     }
     out.users = kept;
+    out.classes.sort_by(|a, b| a.path.cmp(&b.path));
     out.amcache.sort();
     out
 }
@@ -188,6 +206,34 @@ fn user_label(path: &FPath, name: &str) -> String {
     } else {
         prefix.to_string()
     }
+}
+
+/// The prefix of `<user>_UsrClass.dat`, else the profile folder: the folder holding the
+/// `AppData` the hive is under, else the hive's own folder.
+fn class_label(path: &FPath, name: &str) -> String {
+    let prefix = &name[..name.len() - CLASS_HIVE_NAME.len()];
+    let prefix = prefix.trim_end_matches(['_', '-', '.', ' ']);
+    if !prefix.is_empty() {
+        return prefix.to_string();
+    }
+    let folders: Vec<&str> = path
+        .parent()
+        .map(|p| {
+            p.components()
+                .filter_map(|c| match c {
+                    Component::Normal(n) => Some(n),
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    folders
+        .iter()
+        .rposition(|f| f.eq_ignore_ascii_case("AppData"))
+        .and_then(|i| i.checked_sub(1))
+        .or_else(|| folders.len().checked_sub(1))
+        .map(|i| folders[i].to_string())
+        .unwrap_or_else(|| "MountedUser".to_string())
 }
 
 fn set_aside(path: &FPathBuf, why: String) -> Finding {
@@ -252,6 +298,39 @@ mod tests {
         assert_eq!(found.amcache.len(), 1);
         // Two SYSTEM copies set aside, one SAM rejected by its header.
         assert_eq!(found.findings.len(), 3, "{:?}", found.findings);
+    }
+
+    #[test]
+    fn finds_class_hives_labelled_like_their_user_hive() {
+        let fs = InMemoryVirtualFileSystem::new()
+            .with_file("C/Users/alice/NTUSER.DAT", base_block(""))
+            .with_file(
+                "C/Users/alice/AppData/Local/Microsoft/Windows/UsrClass.dat",
+                base_block(r"\??\C:\Users\alice\AppData\Local\Microsoft\Windows\UsrClass.dat"),
+            )
+            .with_file("host/CopiedFiles/registry/bob_UsrClass.dat", base_block(""))
+            .with_file("exports/usrclass.dat", base_block(""))
+            .with_file(
+                "C/Users/eve/AppData/Local/Microsoft/Windows/UsrClass.dat",
+                b"short".to_vec(),
+            );
+        let found = find_hives(&fs);
+        assert!(found.errors.is_empty(), "{:?}", found.errors);
+        let classes: Vec<(&str, &str)> = found
+            .classes
+            .iter()
+            .map(|u| (u.label.as_str(), u.path.as_str()))
+            .collect();
+        assert_eq!(
+            classes,
+            [
+                ("alice", "C/Users/alice/AppData/Local/Microsoft/Windows/UsrClass.dat"),
+                ("exports", "exports/usrclass.dat"),
+                ("bob", "host/CopiedFiles/registry/bob_UsrClass.dat"),
+            ]
+        );
+        let users: Vec<&str> = found.users.iter().map(|u| u.label.as_str()).collect();
+        assert_eq!(users, ["alice"]);
     }
 
     #[test]
