@@ -3,7 +3,8 @@
 ## Project Overview
 
 frnsc-hive implements the `forensic-rs` `Registry`, `RecoverDeleted`, and `FormatFactory` traits for
-Windows registry hive files (`SYSTEM`, `SOFTWARE`, `SECURITY`, `SAM`, per-user `NTUSER.DAT`),
+Windows registry hive files (`SYSTEM`, `SOFTWARE`, `SECURITY`, `SAM`, per-user `NTUSER.DAT` and
+`UsrClass.dat` as `HKU\<sid>_Classes`),
 including `.LOG1`/`.LOG2` transaction log replay and best-effort deleted key/value carving from
 unallocated cells, plus a purely in-memory "mounted" key/value tree that layers on top of (or
 stands in for) real hive-backed keys.

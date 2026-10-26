@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Users' class hives: `UsrClass.dat` is loaded next to each `NTUSER.DAT` as `HKU\<sid>_Classes`
+  (from `<ProfileImagePath>\AppData\Local\Microsoft\Windows` through `ProfileList`, or found by
+  name as `discovery::HiveCandidates::classes`, then `HKU\<label>_Classes` when no SID maps it),
+  with its `.LOG1`/`.LOG2` replayed like the other hives.
+- `load_from_fs` loads a collection of user hives alone (no machine hive, e.g. a per-user
+  registry collection) instead of returning `None`; the users are loaded under their labels.
 - `value` module: the registry value type codes and the decoding of a value's bytes
   (`value::decode`, `decode_resident_value`, `parse_offsets_list`, `BIG_DATA_SEGMENT_SIZE`),
   moved out of `reader` and made public so other sources of hive cells (a hive read from

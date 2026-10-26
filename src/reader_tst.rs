@@ -949,6 +949,37 @@ fn load_from_fs_finds_a_triage_collection_by_name() {
 }
 
 #[test]
+fn load_from_fs_loads_a_user_only_collection_with_its_class_hive() {
+    use forensic_rs::prelude::testing::InMemoryVirtualFileSystem;
+    let ntuser = std::fs::read("./artifacts/C/Users/SuperSecretAdmin/NTUSER.DAT").unwrap();
+    // Any valid hive stands in for the class hive: only where it's mounted is under test.
+    let fs: Arc<dyn FileSystem> = Arc::new(
+        InMemoryVirtualFileSystem::new()
+            .with_file("C/Users/alice/NTUSER.DAT", ntuser.clone())
+            .with_file("C/Users/alice/AppData/Local/Microsoft/Windows/UsrClass.dat", ntuser),
+    );
+    let (reader, findings) = HiveRegistryReader::load_from_fs(&fs);
+    let reader = reader.expect("user hives alone are still a registry");
+    assert!(reader.sam.is_none() && reader.software.is_none());
+    assert!(reader.key(r"HKU\alice").is_ok());
+    assert!(reader.key(r"HKU\alice_Classes").is_ok());
+    let names: Vec<String> = reader
+        .key("HKU")
+        .unwrap()
+        .keys()
+        .unwrap()
+        .into_iter()
+        .map(|k| k.name)
+        .collect();
+    assert_eq!(names, ["alice", "alice_Classes"]);
+    let titles: Vec<&str> = findings.iter().map(|f| f.title.as_str()).collect();
+    assert!(
+        titles.iter().any(|t| t.contains(r"without a SID: HKU\alice_Classes")),
+        "{titles:?}"
+    );
+}
+
+#[test]
 fn load_from_fs_returns_none_without_machine_hives() {
     use forensic_rs::prelude::testing::InMemoryVirtualFileSystem;
     let fs: Arc<dyn FileSystem> = Arc::new(InMemoryVirtualFileSystem::new().with_text_file("notes.txt", "no hives"));

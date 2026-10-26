@@ -43,6 +43,11 @@ use crate::{
     value::{self, BIG_DATA_SEGMENT_SIZE, DATA_TYPE_NONE, decode_resident_value, parse_offsets_list},
 };
 
+/// What a user's class hive is loaded under in `HKU`, after the user's SID or label.
+const CLASSES_SUFFIX: &str = "_Classes";
+/// Where a profile keeps its class hive, `UsrClass.dat`.
+const CLASSES_DIR: &str = r"AppData\Local\Microsoft\Windows";
+
 /// Implements [Registry] from Hive files.
 ///
 /// ```
@@ -122,7 +127,11 @@ impl HiveRegistryReader {
     /// ([crate::discovery::find_hives]): a triage collection such as
     /// `CopiedFiles/registry/SYSTEM` + `<user>_NTUSER.DAT`. A user hive found that way is mapped
     /// to its SID through `ProfileList` by profile folder name; when nothing maps it, it is loaded
-    /// under `HKU\<label>` and a finding says its SID is unresolved.
+    /// under `HKU\<label>` and a finding says its SID is unresolved. A collection of user hives
+    /// alone, with no machine hive at all, loads the same way.
+    ///
+    /// Each user's `UsrClass.dat` is loaded next to its `NTUSER.DAT` as `HKU\<sid>_Classes` (or
+    /// `HKU\<label>_Classes`), with its transaction logs replayed like any other hive.
     pub fn load_from_fs(fs: &Arc<dyn FileSystem>) -> (Option<HiveRegistryReader>, Vec<Finding>) {
         let mut reader = HiveRegistryReader::new();
         let mut findings = Vec::new();
@@ -155,11 +164,11 @@ impl HiveRegistryReader {
                 any = true;
             }
         }
-        if !any {
+        if !any && found.users.is_empty() && found.classes.is_empty() {
             return (None, findings);
         }
         reader.record_findings(findings);
-        reader.load_found_user_hives(fs, &found.users);
+        reader.load_found_user_hives(fs, &found.users, &found.classes);
         let all = reader.findings();
         (Some(reader), all)
     }
@@ -173,9 +182,14 @@ impl HiveRegistryReader {
         }
     }
 
-    /// Loads user hives found by name, keyed by the SID `ProfileList` gives their profile folder,
-    /// or by their label when none does.
-    fn load_found_user_hives(&mut self, fs: &Arc<dyn FileSystem>, users: &[crate::discovery::UserHive]) {
+    /// Loads user and class hives found by name, keyed by the SID `ProfileList` gives their
+    /// profile folder, or by their label when none does; class hives get the `_Classes` suffix.
+    fn load_found_user_hives(
+        &mut self,
+        fs: &Arc<dyn FileSystem>,
+        users: &[crate::discovery::UserHive],
+        classes: &[crate::discovery::UserHive],
+    ) {
         let mut findings = Vec::new();
         let mut sid_of: BTreeMap<String, String> = BTreeMap::new();
         match windows::users_with_errors(&*self) {
@@ -191,28 +205,33 @@ impl HiveRegistryReader {
             }
             Err(e) => findings.push(Finding::from_error("reading ProfileList", &e)),
         }
-        for user in users {
+        let hives = users
+            .iter()
+            .map(|u| (u, ""))
+            .chain(classes.iter().map(|u| (u, CLASSES_SUFFIX)));
+        for (user, suffix) in hives {
             let (dir, file) = split(user.path.as_path());
             let Some(hive) = open_hive_with_logs(fs, dir, file, &mut findings) else {
                 continue;
             };
             match sid_of.get(&user.label.to_ascii_lowercase()) {
-                Some(sid) => self.add_user(sid, hive),
+                Some(sid) => self.add_user(&format!("{sid}{suffix}"), hive),
                 None => {
+                    let name = format!("{}{suffix}", user.label);
                     findings.push(
                         Finding::new(
                             FindingSeverity::Low,
                             FindingCategory::MissingData,
-                            format!("User hive loaded without a SID: HKU\\{}", user.label),
+                            format!("User hive loaded without a SID: HKU\\{name}"),
                         )
                         .with_description(format!(
-                            "{} was loaded under HKU\\{}: no ProfileList entry maps that profile \
+                            "{} was loaded under HKU\\{name}: no ProfileList entry maps that profile \
                              folder to a SID, so records from it carry the label, not a SID.",
-                            user.path, user.label
+                            user.path
                         ))
                         .with_metadata(Text::Borrowed("hive.path"), Text::Owned(user.path.to_string())),
                     );
-                    self.add_user(&user.label, hive);
+                    self.add_user(&name, hive);
                 }
             }
         }
@@ -277,6 +296,10 @@ impl HiveRegistryReader {
                 }
             };
             self.add_user(&profile.sid, hive);
+            let classes_dir = profile.profile_path.as_path().join(CLASSES_DIR);
+            if let Some(hive) = open_hive_with_logs(fs, classes_dir.as_path(), "UsrClass.dat", &mut findings) {
+                self.add_user(&format!("{}{CLASSES_SUFFIX}", profile.sid), hive);
+            }
         }
         self.record_findings(findings);
         Ok(())
