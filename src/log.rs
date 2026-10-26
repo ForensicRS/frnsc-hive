@@ -252,6 +252,18 @@ fn parse_log_entry(buf: &[u8]) -> ForensicResult<(LogEntry, usize)> {
     ))
 }
 
+/// Whether `buf` is too short to hold its first entry yet: shorter than a header's signature and
+/// size, or an `HvLE` header whose declared size runs past what has been read so far. Entries span
+/// as many 512-byte sectors as their dirty pages need, so one is only malformed once its declared
+/// size is in the buffer and it still doesn't parse.
+fn is_incomplete(buf: &[u8]) -> bool {
+    if buf.len() < 8 {
+        return true;
+    }
+    let size = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]) as usize;
+    buf[0..4] == LOG_ENTRY_SIGNATURE && size >= LOG_ENTRY_HEADER_SIZE && size > buf.len()
+}
+
 /// Reads every well-formed, hash-valid `HvLE` entry from `file`, starting at
 /// [LOG_ENTRIES_START_OFFSET]. Stops (without erroring) at the first invalid signature/size/hash
 /// or truncation, returning whatever valid entries were read before that point — matching this
@@ -283,7 +295,10 @@ pub fn read_log_entries(file: &mut Box<dyn VirtualFile>, findings: &mut Vec<Find
                     entries.push(entry);
                     buf.drain(0..consumed);
                 }
-                Err(_) if buf.len() < LOG_ENTRY_ALIGNMENT => break, // need more bytes, or truly done
+                Err(_) if is_incomplete(&buf) => break, // need more bytes, or truly done
+                // No `HvLE` where the next entry would start: the log's entries end here (what
+                // follows is zero fill or sectors left over from earlier use of the file).
+                Err(_) if buf[0..4] != LOG_ENTRY_SIGNATURE => return Ok(entries),
                 Err(e) => {
                     warn!("Stopping log entry read at a malformed/unhashable entry: {:?}", e);
                     findings.push(
@@ -476,6 +491,42 @@ mod tst {
         assert_eq!(2, entry.pages.len());
         assert_eq!(b"1234", entry.page_slice(0).unwrap());
         assert_eq!(b"BEEFCAFE", entry.page_slice(1).unwrap());
+    }
+
+    #[test]
+    fn reads_entries_spanning_several_sectors() {
+        use forensic_rs::prelude::{FPath, FileSystem, testing::InMemoryVirtualFileSystem};
+        // A 4 KiB dirty page makes a 9-sector entry, the usual case in real logs.
+        let page = vec![0xAB; 4096];
+        let mut log = vec![0u8; LOG_ENTRIES_START_OFFSET as usize];
+        log.extend_from_slice(&build_entry(7, 8192, &[(0, &page)]));
+        log.extend_from_slice(&build_entry(8, 8192, &[(4096, b"tail")]));
+        // Zero fill after the last entry is the end of the log, not a malformed entry.
+        log.extend_from_slice(&[0u8; 1024]);
+        let fs = InMemoryVirtualFileSystem::new().with_file("log1", log);
+        let mut file = fs.open(FPath::new("log1")).unwrap();
+        let mut findings = Vec::new();
+        let entries = read_log_entries(&mut file, &mut findings).unwrap();
+        assert!(findings.is_empty(), "{findings:?}");
+        let sequences: Vec<u32> = entries.iter().map(|e| e.sequence_number).collect();
+        assert_eq!(sequences, [7, 8]);
+        assert_eq!(Some(page.as_slice()), entries[0].page_slice(0));
+    }
+
+    #[test]
+    fn a_corrupted_entry_after_valid_ones_is_a_finding() {
+        use forensic_rs::prelude::{FPath, FileSystem, testing::InMemoryVirtualFileSystem};
+        let mut log = vec![0u8; LOG_ENTRIES_START_OFFSET as usize];
+        log.extend_from_slice(&build_entry(7, 8192, &[(0, b"good")]));
+        let mut bad = build_entry(8, 8192, &[(0, b"evil")]);
+        bad[100] ^= 0xFF; // breaks Hash-1
+        log.extend_from_slice(&bad);
+        let fs = InMemoryVirtualFileSystem::new().with_file("log1", log);
+        let mut file = fs.open(FPath::new("log1")).unwrap();
+        let mut findings = Vec::new();
+        let entries = read_log_entries(&mut file, &mut findings).unwrap();
+        assert_eq!(1, entries.len());
+        assert_eq!(1, findings.len(), "{findings:?}");
     }
 
     #[test]

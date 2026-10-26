@@ -75,6 +75,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `log::read_log_entries` rejected every `HvLE` entry longer than one 512-byte sector — i.e. any
+  entry carrying a dirty page — as malformed, because it only asked for more bytes while fewer than
+  512 had been read. Real `.LOG1`/`.LOG2` files therefore never replayed. An entry is now read
+  until its declared size is buffered. A sector without the `HvLE` signature where the next entry
+  would start ends the log quietly (zero fill or sectors left from earlier use), instead of being
+  reported as a malformed entry; hash and size failures are still findings.
 - `hive::checksum_is_correct` now bounds-checks its input instead of indexing directly, avoiding a
   panic on a shorter-than-expected buffer (relevant now that `HiveFormatFactory::probe` feeds it
   arbitrary files).
